@@ -1,0 +1,2 @@
+# The GORM end-to-end test drives the binary from Go; it is not part of bucketdb.
+tests/gorm/** linguist-detectable=false
