@@ -419,18 +419,40 @@ fn delete_chunks(s3: &Client, base: &str, chunks: u64) {
 /// When it exists, or on S3 errors.
 pub fn create(s3: &Client, db: &str, chunk_pages: u64) -> io::Result<()> {
     s3.create_bucket()?;
-    store::create(
-        s3,
-        db,
-        &Manifest {
-            version: 1,
-            page_size: 4096,
-            chunk_pages: chunk_pages.max(1) as u32,
-            base: format!("{db}/base/empty"),
-            chunks: BTreeMap::new(),
-            ..Default::default()
-        },
-    )
+    store::create(s3, db, &empty(db, chunk_pages))
+}
+
+/// An empty database, unless the bucket holds one already: what a sidecar given
+/// a bucket of its own starts on. The bucket must exist; it is not made here, as
+/// whoever gave it may not let a sidecar make buckets. Two sidecars starting at
+/// once both find it there: one writes the manifest, the other's If-None-Match
+/// fails, and neither minds.
+///
+/// # Errors
+///
+/// On S3 errors.
+pub fn ensure(s3: &Client, db: &str, chunk_pages: u64) -> io::Result<()> {
+    if store::fetch_manifest(s3, db)?.is_some() {
+        return Ok(());
+    }
+    match s3.put(
+        &store::manifest_key(db),
+        &serde_json::to_vec(&empty(db, chunk_pages)).map_err(io::Error::other)?,
+        Cond::IfNoneMatch,
+    )? {
+        Put::Done { .. } | Put::PreconditionFailed => Ok(()),
+    }
+}
+
+fn empty(db: &str, chunk_pages: u64) -> Manifest {
+    Manifest {
+        version: 1,
+        page_size: 4096,
+        chunk_pages: chunk_pages.max(1) as u32,
+        base: format!("{db}/base/empty"),
+        chunks: BTreeMap::new(),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

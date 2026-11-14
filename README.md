@@ -156,6 +156,7 @@ export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 bucketdb import data/app.sqlite s3://bucket/app      # upload a SQLite file as a database
 bucketdb create s3://bucket/app                      # or start an empty one
 bucketdb serve --port 5432 s3://bucket/app           # postgres://localhost/app
+bucketdb serve --create s3://bucket/app              # an empty one first, where none is
 bucketdb compact s3://bucket/app                     # fold the segments now
 ```
 

@@ -23,7 +23,8 @@ const USAGE: &str = "usage:
   bucketdb upsert <base.sqlite> <updated.sqlite> s3://bucket/db
                                                    commit the pages updated changed;
                                                    base must be what the bucket holds
-  bucketdb serve [--host H] [--port P] [--dir D] s3://bucket/db...
+  bucketdb serve [--host H] [--port P] [--dir D] [--create] s3://bucket/db...
+                                                   (--create: an empty one where none is)
   bucketdb create s3://bucket/db                   an empty database
   bucketdb compact s3://bucket/db
 
@@ -154,12 +155,14 @@ fn serve(args: &[String]) -> Result<()> {
     };
     let mut dir = std::env::var("BUCKETDB_DIR").unwrap_or_else(|_| default_dir.into());
     let mut remotes = Vec::new();
+    let mut create = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--host" => host.clone_from(it.next().ok_or("--host needs a value")?),
             "--port" => port = it.next().ok_or("--port needs a value")?.parse()?,
             "--dir" => dir.clone_from(it.next().ok_or("--dir needs a value")?),
+            "--create" => create = true,
             url => remotes.push(Remote::parse(url)?),
         }
     }
@@ -185,6 +188,9 @@ fn serve(args: &[String]) -> Result<()> {
             clients.push((remote.bucket.clone(), c.clone()));
             c
         };
+        if create {
+            sync::ensure(&s3, &remote.db, chunk_pages())?;
+        }
         let rdb = Arc::new(store::RemoteDb::open(&remote.db, s3, store::Options::from_env())?);
         log::info!("{}: {remote}", remote.name);
         served.push((path.to_string_lossy().into_owned(), rdb.clone()));
