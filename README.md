@@ -1,9 +1,8 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/bucketdb-wordmark-dark.svg">
-    <img alt="bucketdb" src="assets/bucketdb-wordmark-light.svg" width="420">
-  </picture>
+  <img alt="" src="assets/bucketdb.svg" width="128">
 </p>
+
+<h1 align="center">bucketdb</h1>
 
 <p align="center"><b>A Postgres database that lives in an S3 bucket, served by a sidecar.</b></p>
 
