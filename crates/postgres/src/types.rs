@@ -24,6 +24,43 @@ pub const TIMESTAMPTZ: u32 = 1184;
 pub const UUID: u32 = 2950;
 pub const JSONB: u32 = 3802;
 
+/// The boolean columns of the catalog views (funcs::CATALOG), which are expressions
+/// with no declared type: by name, so they go out as t/f, which psql tests for.
+pub fn catalog_bool(name: &str) -> bool {
+    matches!(
+        name,
+        "attnotnull"
+            | "atthasdef"
+            | "attisdropped"
+            | "attislocal"
+            | "relhasindex"
+            | "relhasrules"
+            | "relhastriggers"
+            | "relhassubclass"
+            | "relrowsecurity"
+            | "relforcerowsecurity"
+            | "relhasoids"
+            | "relispartition"
+            | "indisunique"
+            | "indisprimary"
+            | "indisexclusion"
+            | "indimmediate"
+            | "indisclustered"
+            | "indisvalid"
+            | "indisready"
+            | "indislive"
+            | "indisreplident"
+            | "condeferrable"
+            | "condeferred"
+            | "convalidated"
+            | "conislocal"
+            | "connoinherit"
+            | "inhdetachpending"
+            | "polpermissive"
+            | "puballtables"
+    )
+}
+
 /// The OID a column of this declared type goes out as.
 pub fn oid_of_decl(decl: Option<&str>) -> u32 {
     let Some(d) = decl else { return TEXT };

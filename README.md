@@ -99,8 +99,13 @@ psql postgres://postgres@localhost:5432/app -c 'select count(*) from users'
   TYPE / SET DEFAULT are no-ops too (SQLite columns are typeless).
 - Catalogs: per-connection views of `information_schema` (tables, columns,
   table_constraints, constraint_column_usage) and `pg_catalog` (pg_class,
-  pg_attribute, pg_type, pg_namespace, pg_indexes, pg_description), plus
-  format_type(): what GORM's AutoMigrate reads.
+  pg_attribute, pg_attrdef, pg_index, pg_constraint, pg_type, pg_namespace,
+  pg_database, pg_indexes...) over SQLite's schema, with format_type(),
+  pg_get_indexdef(), pg_get_constraintdef() and the `~` operators: what GORM's
+  AutoMigrate reads, and psql's `\l`, `\dn`, `\d`, `\dt`, `\di`, `\d table` and
+  `\d+ table` (columns, defaults, indexes, foreign keys both ways). Indexes take
+  Postgres' names (`t_pkey`, `t_col_key`); there are no triggers, policies or
+  partitions to show.
 - Types: a column keeps its Postgres type as its declared type; that decides the OID.
   Booleans are 1/0, timestamps UTC text, so they sort as they compare. A parameter's
   type comes from the column it meets (`col = $1`, `IN`, `BETWEEN`, INSERT, UPDATE
@@ -209,7 +214,7 @@ See [AGENTS.md](AGENTS.md) for the conventions (English, Conventional Commits).
 
 ## Not yet
 
-- psql's `\d` (its catalog queries go far beyond these views).
+- CHECK constraints in `\d table`, and psql's other `\d` commands (functions, types, roles).
 - Arrays, interval arithmetic, COPY, LISTEN/NOTIFY, generate_series.
 - A foreign key or check added with ALTER TABLE is accepted but not enforced
   (SQLite only takes constraints in CREATE TABLE); one in CREATE TABLE is.

@@ -652,7 +652,13 @@ impl Session {
                 let cols = stmt
                     .columns()
                     .iter()
-                    .map(|c| (c.name().to_string(), types::oid_of_decl(c.decl_type())))
+                    .map(|c| {
+                        let oid = match c.decl_type() {
+                            None if types::catalog_bool(c.name()) => types::BOOL,
+                            decl => types::oid_of_decl(decl),
+                        };
+                        (c.name().to_string(), oid)
+                    })
                     .collect();
                 drop(stmt);
                 let mut oids = Vec::with_capacity(*params);

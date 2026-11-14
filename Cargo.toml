@@ -28,6 +28,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 log = { version = "0.4", features = ["std"] }
 # statvfs, for the disk cache's default size in Lambda (already under rusqlite).
 libc = "0.2"
+# The ~ operators, for psql's name patterns. The small one: no Unicode tables.
+regex-lite = "0.1"
 
 [package]
 name = "bucketdb"

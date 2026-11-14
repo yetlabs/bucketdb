@@ -2,9 +2,10 @@
 //! two differ, printed back. What SQLite already takes stays as it is: `$1`
 //! parameters (named parameters to SQLite), RETURNING, ON CONFLICT, quoted names.
 //!
-//! The rewrites: casts to SQLite's types, ILIKE, a `public.` schema, row locks,
-//! the Postgres column types and serials of CREATE TABLE, index methods, and the
-//! statements that only set or show session state.
+//! The rewrites: casts to SQLite's types, ILIKE, the regex operators, COLLATE, a
+//! `public.` schema, row locks, the Postgres column types and serials of CREATE
+//! TABLE, index methods, the statements that only set or show session state, and
+//! the catalog functions psql's `\d` calls.
 
 use crate::types;
 use sqlparser::ast::{
@@ -295,9 +296,134 @@ fn name_columns(q: &mut ast::Query) {
     }
 }
 
+/// A select-list `x::regclass` shows the relation's name; elsewhere (`oid =
+/// '16385'::regclass`) the cast keeps the OID.
+fn regclass_names(q: &mut ast::Query) -> Result<(), String> {
+    if let ast::SetExpr::Select(sel) = q.body.as_mut() {
+        for item in &mut sel.projection {
+            if let ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } = item
+                && let Expr::Cast { expr, data_type, .. } = e
+                && data_type.to_string().to_ascii_lowercase().ends_with("regclass")
+            {
+                *e = parse_expr(&format!("pg_regclass({expr})"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `~`, `~*`, `!~`, `!~*`, also as `OPERATOR(pg_catalog.~)`: (negated, case-insensitive).
+fn regex_op(op: &ast::BinaryOperator) -> Option<(bool, bool)> {
+    use ast::BinaryOperator as B;
+    match op {
+        B::PGRegexMatch => Some((false, false)),
+        B::PGRegexIMatch => Some((false, true)),
+        B::PGRegexNotMatch => Some((true, false)),
+        B::PGRegexNotIMatch => Some((true, true)),
+        B::PGCustomBinaryOperator(v) => match v.last()?.as_str() {
+            "~" => Some((false, false)),
+            "~*" => Some((false, true)),
+            "!~" => Some((true, false)),
+            "!~*" => Some((true, true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The catalog functions psql calls, as SQL over the catalog views (funcs::CATALOG);
+/// `pg_catalog.f` is f. None leaves the call as it is.
+fn catalog_call(f: &mut ast::Function) -> Option<String> {
+    if f.name.0.len() == 2
+        && matches!(&f.name.0[0], ObjectNamePart::Identifier(s) if s.value.eq_ignore_ascii_case("pg_catalog"))
+    {
+        f.name.0.remove(0);
+    }
+    let ObjectNamePart::Identifier(name) = f.name.0.last()? else {
+        return None;
+    };
+    let args: Vec<String> = match &f.args {
+        ast::FunctionArguments::List(l) => l.args.iter().map(ToString::to_string).collect(),
+        _ => vec![],
+    };
+    let arg = |i: usize| args.get(i).cloned().unwrap_or_else(|| "NULL".into());
+    Some(match name.value.to_ascii_lowercase().as_str() {
+        "pg_table_is_visible" | "pg_relation_is_publishable" => "1".into(),
+        "pg_get_userbyid" => "'postgres'".into(),
+        "pg_encoding_to_char" => "'UTF8'".into(),
+        "pg_get_expr" | "pg_partition_ancestors" => arg(0),
+        "pg_get_indexdef" => format!(
+            "pg_lookup('SELECT indexdef FROM pg_bucketdb_index WHERE oid = ?', {})",
+            arg(0)
+        ),
+        "pg_get_constraintdef" => format!(
+            "pg_lookup('SELECT condef FROM pg_constraint WHERE oid = ?', {})",
+            arg(0)
+        ),
+        "obj_description" | "col_description" | "shobj_description" => "NULL".into(),
+        // There are no arrays: psql joins role arrays of row policies, which are none.
+        "array_to_string" | "pg_get_statisticsobjdef_columns" | "pg_get_triggerdef" => "NULL".into(),
+        _ => return None,
+    })
+}
+
+/// A table is never partitioned: `pg_partition_ancestors(x) [WITH ORDINALITY] AS a
+/// (relid, depth)` in a FROM, as psql writes it, is an empty table.
+struct NoPartitions;
+
+impl ast::VisitorMut for NoPartitions {
+    type Break = ();
+
+    fn post_visit_table_factor(&mut self, tf: &mut ast::TableFactor) -> ControlFlow<()> {
+        if let ast::TableFactor::Table {
+            name,
+            args: Some(_),
+            alias,
+            ..
+        } = tf
+            && matches!(name.0.last(), Some(ObjectNamePart::Identifier(i)) if i.value == "pg_partition_ancestors")
+        {
+            let mut alias = alias.take();
+            let cols: Vec<String> = alias
+                .as_mut()
+                .map(|a| {
+                    std::mem::take(&mut a.columns)
+                        .into_iter()
+                        .map(|c| c.name.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cols = if cols.is_empty() {
+                vec!["relid".to_string()]
+            } else {
+                cols
+            };
+            let select = cols
+                .iter()
+                .map(|c| format!("NULL AS {c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(q) = Parser::new(&PostgreSqlDialect {})
+                .try_with_sql(&format!("SELECT {select} WHERE 0"))
+                .and_then(|mut p| p.parse_query())
+            {
+                *tf = ast::TableFactor::Derived {
+                    lateral: false,
+                    subquery: q,
+                    alias,
+                    sample: None,
+                };
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 fn rewrite(stmt: &mut Statement) -> Result<(), String> {
+    let _ = ast::VisitMut::visit(stmt, &mut NoPartitions);
     if let Statement::Query(q) = stmt {
         name_columns(q);
+        regclass_names(q)?;
     }
     let _ = visit_relations_mut(stmt, |name: &mut ObjectName| {
         if name.0.len() == 2
@@ -349,6 +475,35 @@ fn rewrite(stmt: &mut Statement) -> Result<(), String> {
                 match parse_expr(&format!("lower({expr}) {not}LIKE lower({pattern}){esc}")) {
                     Ok(x) => *e = x,
                     Err(m) => err = Some(m),
+                }
+            }
+            // SQLite's collations are not Postgres': the default it is.
+            Expr::Collate { expr, .. } => *e = Expr::Nested(expr.clone()),
+            Expr::BinaryOp { left, op, right } => {
+                if let Some((negated, ci)) = regex_op(op) {
+                    let not = if negated { "NOT " } else { "" };
+                    match parse_expr(&format!("{not}pg_regex({left}, {right}, {})", i32::from(ci))) {
+                        Ok(x) => *e = x,
+                        Err(m) => err = Some(m),
+                    }
+                }
+            }
+            // x = ANY(list): the catalogs keep lists as text ('{a,b}', int2vector's '1 2').
+            Expr::AnyOp {
+                left,
+                compare_op: ast::BinaryOperator::Eq,
+                right,
+                ..
+            } => match parse_expr(&format!("pg_any({left}, {right})")) {
+                Ok(x) => *e = x,
+                Err(m) => err = Some(m),
+            },
+            Expr::Function(f) => {
+                if let Some(sql) = catalog_call(f) {
+                    match parse_expr(&sql) {
+                        Ok(x) => *e = Expr::Nested(Box::new(x)),
+                        Err(m) => err = Some(m),
+                    }
                 }
             }
             _ => {}
