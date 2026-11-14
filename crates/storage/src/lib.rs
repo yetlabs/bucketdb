@@ -4,10 +4,12 @@
 //! (see [`store`]). The [`vfs`] makes that SQLite's main file: pages are read on
 //! demand through a cache, and a transaction commits as a segment plus a conditional
 //! swap of the manifest. [`sync`] moves whole files in and out: import, export, and
-//! upsert of the pages a local copy changed.
+//! upsert of the pages a local copy changed; [`past`], a versioned bucket's past:
+//! a commit's version looked at, exported or restored.
 //!
 //! A database is addressed as `s3://bucket/path` ([`Remote`]).
 
+pub mod past;
 pub mod s3;
 pub mod store;
 pub mod sync;

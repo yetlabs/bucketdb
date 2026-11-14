@@ -8,7 +8,7 @@
 mod lambda;
 
 use bucketdb_postgres as postgres;
-use bucketdb_storage::{Remote, env_num, lambda_memory_mb, store, sync, vfs};
+use bucketdb_storage::{Remote, env_num, lambda_memory_mb, past, store, sync, vfs};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,11 +20,17 @@ const USAGE: &str = "usage:
                                                    upload a SQLite file as the database
                                                    (--replace: over the one there)
   bucketdb export s3://bucket/db <file.sqlite>     download it, and pin that version
+  bucketdb export --at WHEN s3://bucket/db <file>  download a version of the past
+  bucketdb versions [--limit N] s3://bucket/db     its versions the bucket keeps, as JSON
+  bucketdb restore --at WHEN s3://bucket/db        make a version of the past the current one
+                                                   (WHEN: a version id, or a moment, RFC 3339;
+                                                   the bucket's versioning on)
   bucketdb upsert <base.sqlite> <updated.sqlite> s3://bucket/db
                                                    commit the pages updated changed;
                                                    base must be what the bucket holds
-  bucketdb serve [--host H] [--port P] [--dir D] [--create] s3://bucket/db...
-                                                   (--create: an empty one where none is)
+  bucketdb serve [--host H] [--port P] [--dir D] [--create] [--at WHEN] s3://bucket/db...
+                                                   (--create: an empty one where none is;
+                                                   --at: a version of the past, read only)
   bucketdb create s3://bucket/db                   an empty database
   bucketdb compact s3://bucket/db
 
@@ -64,6 +70,10 @@ fn main() {
         Some("import") if args.len() == 3 => import(&args[1], &args[2], false),
         Some("import") if args.len() == 4 && args[1] == "--replace" => import(&args[2], &args[3], true),
         Some("export") if args.len() == 3 => export(&args[1], &args[2]),
+        Some("export") if args.len() == 5 && args[1] == "--at" => export_at(&args[2], &args[3], &args[4]),
+        Some("versions") if args.len() == 2 => versions(&args[1], "0"),
+        Some("versions") if args.len() == 4 && args[1] == "--limit" => versions(&args[3], &args[2]),
+        Some("restore") if args.len() == 4 && args[1] == "--at" => restore(&args[2], &args[3]),
         Some("upsert") if args.len() == 4 => upsert(&args[1], &args[2], &args[3]),
         Some("serve") => serve(&args[1..]),
         Some("compact") if args.len() == 2 => compact(&args[1]),
@@ -97,6 +107,33 @@ fn chunk_pages() -> u64 {
 
 fn threads() -> u64 {
     env_num("BUCKETDB_UPLOAD_THREADS", 16)
+}
+
+fn export_at(when: &str, url: &str, file: &str) -> Result<()> {
+    let (remote, file) = (Remote::parse(url)?, local(file)?);
+    let s3 = remote.client()?;
+    let snap = past::at(&s3, &remote.db, when)?;
+    past::export_at(&s3, &snap, file, threads())?;
+    log::info!("exported v{} of {remote}, as of {when}", snap.manifest.version);
+    Ok(())
+}
+
+/// Prints the versions the bucket keeps, the newest first, as JSON.
+fn versions(url: &str, limit: &str) -> Result<()> {
+    let remote = Remote::parse(url)?;
+    let s3 = remote.client()?;
+    let list = past::versions(&s3, &remote.db, limit.parse()?)?;
+    println!("{}", serde_json::to_string(&list)?);
+    Ok(())
+}
+
+fn restore(when: &str, url: &str) -> Result<()> {
+    let remote = Remote::parse(url)?;
+    let s3 = remote.client()?;
+    let version = past::restore(&s3, &remote.db, when, chunk_pages(), threads())?;
+    log::info!("{remote}: v{version}, of {when}, is the current version again");
+    s3.log_stats();
+    Ok(())
 }
 
 fn import(file: &str, url: &str, replace: bool) -> Result<()> {
@@ -156,6 +193,7 @@ fn serve(args: &[String]) -> Result<()> {
     let mut dir = std::env::var("BUCKETDB_DIR").unwrap_or_else(|_| default_dir.into());
     let mut remotes = Vec::new();
     let mut create = false;
+    let mut at: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -163,6 +201,7 @@ fn serve(args: &[String]) -> Result<()> {
             "--port" => port = it.next().ok_or("--port needs a value")?.parse()?,
             "--dir" => dir.clone_from(it.next().ok_or("--dir needs a value")?),
             "--create" => create = true,
+            "--at" => at = Some(it.next().ok_or("--at needs a version or a moment")?.clone()),
             url => remotes.push(Remote::parse(url)?),
         }
     }
@@ -188,10 +227,18 @@ fn serve(args: &[String]) -> Result<()> {
             clients.push((remote.bucket.clone(), c.clone()));
             c
         };
-        if create {
+        if create && at.is_none() {
             sync::ensure(&s3, &remote.db, chunk_pages())?;
         }
-        let rdb = Arc::new(store::RemoteDb::open(&remote.db, s3, store::Options::from_env())?);
+        // A version of the past: read only, as it was.
+        let rdb = Arc::new(match &at {
+            Some(when) => {
+                let snap = past::at(&s3, &remote.db, when)?;
+                log::info!("{}: v{}, as of {when}, read only", remote.name, snap.manifest.version);
+                store::RemoteDb::open_pinned(&remote.db, s3, store::Options::from_env(), snap)?
+            }
+            None => store::RemoteDb::open(&remote.db, s3, store::Options::from_env())?,
+        });
         log::info!("{}: {remote}", remote.name);
         served.push((path.to_string_lossy().into_owned(), rdb.clone()));
         rdbs.push(rdb);
@@ -220,6 +267,7 @@ fn serve(args: &[String]) -> Result<()> {
             lambda_memory_mb().map_or(64, |m| (m / 32).clamp(8, 64)),
         )
         .max(1) as usize,
+        read_only: at.is_some(),
     });
     log::info!(
         "bucketdb {}: postgres on {addr} -> {}",

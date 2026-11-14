@@ -125,6 +125,11 @@ impl Snapshot {
         }
     }
 
+    /// A version of the past (past.rs): a manifest the bucket kept, read as it was.
+    pub fn pinned(manifest: Manifest, version_id: String) -> Snapshot {
+        Snapshot::new(manifest, version_id)
+    }
+
     pub fn page_size(&self) -> u64 {
         u64::from(self.manifest.page_size)
     }
@@ -227,6 +232,9 @@ pub struct RemoteDb {
     seq: AtomicU64,
     /// Set when a commit leaves enough segments to fold; the compactor waits on it.
     wake: (Mutex<bool>, std::sync::Condvar),
+    /// A version of the past, served as it was: read only, never newer, its objects
+    /// read from the bucket's kept versions once deleted (past.rs).
+    pub pinned: bool,
 }
 
 pub fn manifest_key(db: &str) -> String {
@@ -275,6 +283,19 @@ impl RemoteDb {
     pub fn open(name: &str, s3: Arc<Client>, opts: Options) -> io::Result<RemoteDb> {
         let snap = fetch_manifest(&s3, name)?
             .ok_or_else(|| io::Error::other(format!("no database {name:?} in bucket {:?}", s3.bucket())))?;
+        RemoteDb::with(name, s3, opts, snap, false)
+    }
+
+    /// A version of the past, served read only as it was (see [`crate::past::at`]).
+    ///
+    /// # Errors
+    ///
+    /// When the disk cache cannot be made.
+    pub fn open_pinned(name: &str, s3: Arc<Client>, opts: Options, snap: Snapshot) -> io::Result<RemoteDb> {
+        RemoteDb::with(name, s3, opts, snap, true)
+    }
+
+    fn with(name: &str, s3: Arc<Client>, opts: Options, snap: Snapshot, pinned: bool) -> io::Result<RemoteDb> {
         let disk = match &opts.disk_cache {
             Some((dir, cap)) => Some(DiskCache::new(dir.join(name), *cap)?),
             None => None,
@@ -297,6 +318,7 @@ impl RemoteDb {
             compactions: AtomicU64::new(0),
             seq: AtomicU64::new(0),
             wake: (Mutex::new(false), std::sync::Condvar::new()),
+            pinned,
         })
     }
 
@@ -311,7 +333,7 @@ impl RemoteDb {
             let cur = lock(&self.current);
             (cur.snap.clone(), cur.checked.elapsed() <= self.opts.staleness)
         };
-        if fresh {
+        if fresh || self.pinned {
             return Ok(snap);
         }
         self.refresh(&snap)
@@ -431,6 +453,16 @@ impl RemoteDb {
     }
 
     fn fetch(&self, key: &str, off: u64, len: u64) -> io::Result<Vec<u8>> {
+        if self.pinned {
+            let body = crate::past::get_any(&self.s3, key, Some((off, len)))?;
+            if (body.len() as u64) < len {
+                return Err(io::Error::other(format!(
+                    "{key}: {} bytes at {off}, wanted {len}",
+                    body.len()
+                )));
+            }
+            return Ok(body);
+        }
         match self.s3.get(key, Some((off, len)), None)? {
             Get::Found { body, .. } if body.len() as u64 >= len => Ok(body),
             Get::Found { body, .. } => Err(io::Error::other(format!(
@@ -479,6 +511,12 @@ impl RemoteDb {
         reads: Option<&HashSet<u64>>,
         page_count: u64,
     ) -> io::Result<Option<Arc<Snapshot>>> {
+        if self.pinned {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "a version of the past is read only",
+            ));
+        }
         let pages: BTreeMap<u64, Vec<u8>> = dirty
             .iter()
             .filter(|(p, _)| **p <= page_count)
@@ -603,7 +641,7 @@ impl RemoteDb {
 
     /// Whether the manifest lists enough segments to fold.
     pub fn wants_compaction(&self) -> bool {
-        lock(&self.current).snap.manifest.segments.len() >= self.opts.compact_segments
+        !self.pinned && lock(&self.current).snap.manifest.segments.len() >= self.opts.compact_segments
     }
 
     /// Waits until a commit asks for a compaction, or the timeout passes (another

@@ -37,6 +37,7 @@ dependencies = [
  "bucketdb-storage",
  "chrono",
  "log",
+ "serde_json",
  "ureq",
 ]
 

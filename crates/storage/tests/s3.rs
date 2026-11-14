@@ -5,7 +5,7 @@
 // The helpers below the tests fail the test they serve, as an assert would.
 #![allow(clippy::unwrap_used)]
 
-use bucketdb_storage::{Remote, store, sync, vfs};
+use bucketdb_storage::{Remote, past, store, sync, vfs};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -163,4 +163,61 @@ fn sqlite_commits_through_the_vfs() {
         .query_row("SELECT v FROM t WHERE id = 1000", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, "through the bucket");
+}
+
+/// With the bucket's versioning on, each commit is a version to read again, export,
+/// or restore — even once a compaction deleted what it named.
+#[test]
+fn a_version_of_the_past_comes_back() {
+    let Some(case) = Case::new("past") else { return };
+    case.s3.enable_versioning().unwrap();
+    let rows = |file: &str| -> i64 {
+        Connection::open(file)
+            .unwrap()
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap()
+    };
+    let first = case.file("first.sqlite");
+    sqlite(&first, 50);
+    case.import(&first, false).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let before = chrono::Utc::now().to_rfc3339();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // A commit that deletes most rows, then a compaction, its leftovers deleted.
+    let (cur, upd) = (case.file("cur.sqlite"), case.file("upd.sqlite"));
+    sync::export(&case.s3, &case.remote.db, &cur, 4).unwrap();
+    std::fs::copy(&cur, &upd).unwrap();
+    Connection::open(&upd)
+        .unwrap()
+        .execute("DELETE FROM t WHERE id > 10", [])
+        .unwrap();
+    sync::upsert(&case.s3, &case.remote.db, &cur, &upd).unwrap();
+    let opts = store::Options::from_env();
+    let live = store::RemoteDb::open(&case.remote.db, case.s3.clone(), opts.clone()).unwrap();
+    live.compact().unwrap();
+    store::collect_garbage(&case.s3, &case.remote.db, std::time::Duration::ZERO, &[]).unwrap();
+    sync::export(&case.s3, &case.remote.db, &cur, 4).unwrap();
+    assert_eq!(rows(&cur), 11);
+
+    let list = past::versions(&case.s3, &case.remote.db, 0).unwrap();
+    assert!(list.len() >= 2 && list[0].latest && !list[1].latest, "{list:?}");
+
+    // As it was then: exported whole, and read only.
+    let snap = past::at(&case.s3, &case.remote.db, &before).unwrap();
+    let old = case.file("old.sqlite");
+    past::export_at(&case.s3, &snap, &old, 4).unwrap();
+    assert_eq!(rows(&old), 50);
+    let pinned = store::RemoteDb::open_pinned(&case.remote.db, case.s3.clone(), opts, snap).unwrap();
+    let base = pinned.snapshot().unwrap();
+    assert!(
+        pinned
+            .commit(&base, &std::collections::BTreeMap::new(), None, 0)
+            .is_err()
+    );
+
+    // Restored: the current version again.
+    past::restore(&case.s3, &case.remote.db, &before, 4, 4).unwrap();
+    sync::export(&case.s3, &case.remote.db, &cur, 4).unwrap();
+    assert_eq!(rows(&cur), 50);
 }

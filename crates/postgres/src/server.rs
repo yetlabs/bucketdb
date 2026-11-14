@@ -23,6 +23,9 @@ pub struct Config {
     pub password: Option<String>,
     /// Connections served at once; one more is refused with 53300.
     pub max_connections: usize,
+    /// Every statement only reads (a version of the past): one that writes is
+    /// refused with 25006, before it reaches the bucket.
+    pub read_only: bool,
 }
 
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
@@ -84,6 +87,7 @@ fn sqlite_error(e: &rusqlite::Error) -> PgError {
             275 => "23514",
             5 | 6 => "55P03",
             13 => "54000", // SQLITE_FULL: the transaction passed BUCKETDB_MAX_TXN_MB
+            8 => "25006",  // SQLITE_READONLY: a version of the past
             _ => "",
         };
         if code == "40001" {
@@ -347,7 +351,7 @@ impl Session {
             }
         }
 
-        let conn = match open(path, &db) {
+        let conn = match open(path, &db, cfg.read_only) {
             Ok(c) => c,
             Err(e) => {
                 send_error(&mut out, "FATAL", &sqlite_error(&e))?;
@@ -895,12 +899,16 @@ fn raw_plan(q: &str) -> Option<Plan> {
     })
 }
 
-fn open(path: &std::path::Path, db: &str) -> rusqlite::Result<Connection> {
+fn open(path: &std::path::Path, db: &str, read_only: bool) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA busy_timeout = 30000; PRAGMA case_sensitive_like = ON; PRAGMA foreign_keys = ON;")?;
     conn.set_prepared_statement_cache_capacity(256);
     funcs::register(&conn, db)?;
     conn.execute_batch(funcs::CATALOG)?;
+    // After the catalog's views, made in the connection's own temp schema.
+    if read_only {
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+    }
     Ok(conn)
 }
 

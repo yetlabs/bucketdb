@@ -192,6 +192,26 @@ Limits: `BUCKETDB_MAX_CONNECTIONS` (64; one more gets `53300`), `BUCKETDB_MAX_TX
 (256; a transaction writing more gets `54000` and rolls back, instead of growing
 memory).
 
+### Its past
+
+With the bucket's versioning on, S3 keeps every manifest a commit replaced and every
+object a compaction deleted: each commit is a version to look at again, export, or
+go back to, for as long as the bucket's lifecycle keeps old versions.
+
+```sh
+bucketdb versions --limit 20 s3://bucket/app          # as JSON: id, at, version, bytes
+bucketdb serve --at 2026-11-14T20:00:00Z s3://bucket/app   # read only, as it was then
+bucketdb export --at <id> s3://bucket/app then.sqlite
+bucketdb restore --at 2026-11-14T20:00:00Z s3://bucket/app
+```
+
+`--at` takes a version's id or a moment (RFC 3339): the newest version committed by
+then. A version served with `--at` is read only (a write gets `25006`) and never
+newer; what a compaction deleted is read from its kept version. `restore` writes the
+version to a file and uploads it as a new base, as `import --replace` does: sidecars
+move to it at their next transaction, and one under way when it lands runs again.
+The key needs `s3:ListBucketVersions` and `s3:GetObjectVersion` besides the usual.
+
 ## AWS Lambda
 
 BucketDB runs as an external extension: put the binary at `/opt/extensions/bucketdb`

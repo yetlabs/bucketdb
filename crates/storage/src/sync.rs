@@ -96,15 +96,51 @@ fn current(s3: &Client, db: &str) -> io::Result<Snapshot> {
 /// On S3 or disk errors, or when a commit lands while it downloads.
 pub fn export(s3: &Client, db: &str, file: &str, threads: u64) -> io::Result<()> {
     let snap = current(s3, db)?;
+    let started = Instant::now();
+    write_file(s3, &snap, file, threads, false)?;
+    let m = &snap.manifest;
+    let sum = digest(file)?;
+    if m.synced.as_deref() != Some(sum.as_str()) {
+        let mut pinned = m.clone();
+        pinned.synced = Some(sum);
+        let json = serde_json::to_vec(&pinned).map_err(io::Error::other)?;
+        if let Put::PreconditionFailed = s3.put(&store::manifest_key(db), &json, Cond::IfMatch(&snap.etag))? {
+            return Err(io::Error::other(format!(
+                "{file} holds v{}, but s3://{}/{db} changed meanwhile: export again",
+                m.version,
+                s3.bucket()
+            )));
+        }
+    }
+    log::info!("exported v{} in {:.1}s", m.version, started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// Writes a version of a database to file: its chunks, then its segments over them.
+/// past: a version of the past, its objects read from the bucket's kept versions
+/// once deleted.
+///
+/// # Errors
+///
+/// On S3 or disk errors.
+pub fn write_file(s3: &Client, snap: &Snapshot, file: &str, threads: u64, past: bool) -> io::Result<()> {
+    let get = |key: &str| -> io::Result<Vec<u8>> {
+        if past {
+            return crate::past::get_any(s3, key, None);
+        }
+        match s3.get(key, None, None)? {
+            Get::Found { body, .. } => Ok(body),
+            _ => Err(io::Error::other(format!("{key}: missing"))),
+        }
+    };
     let m = &snap.manifest;
     let ps = snap.page_size();
     let cp = u64::from(m.chunk_pages);
-    let started = Instant::now();
     let out = File::create(file)?;
     out.set_len(m.page_count * ps)?;
     let base_chunks = m.base_pages.min(m.page_count).div_ceil(cp);
     log::info!(
-        "export s3://{}/{db} v{} -> {file}: {} pages, {base_chunks} chunks, {} segments",
+        "export s3://{} v{} -> {file}: {} pages, {base_chunks} chunks, {} segments",
         s3.bucket(),
         m.version,
         m.page_count,
@@ -121,10 +157,7 @@ pub fn export(s3: &Client, db: &str, file: &str, threads: u64) -> io::Result<()>
                         if c >= base_chunks {
                             return Ok(());
                         }
-                        let key = snap.chunk_key(c);
-                        let Get::Found { body, .. } = s3.get(&key, None, None)? else {
-                            return Err(io::Error::other(format!("{key}: missing")));
-                        };
+                        let body = get(&snap.chunk_key(c))?;
                         // Pages past page_count (the file shrank) are not part of it.
                         let room = (m.page_count - c * cp) * ps;
                         let n = (body.len() as u64).min(room) as usize;
@@ -139,9 +172,7 @@ pub fn export(s3: &Client, db: &str, file: &str, threads: u64) -> io::Result<()>
         Ok(())
     })?;
     for seg in &m.segments {
-        let Get::Found { body, .. } = s3.get(&seg.key, None, None)? else {
-            return Err(io::Error::other(format!("{}: missing", seg.key)));
-        };
+        let body = get(&seg.key)?;
         for (i, &p) in seg.pages.iter().enumerate() {
             if p <= m.page_count {
                 let at = i * ps as usize;
@@ -150,21 +181,6 @@ pub fn export(s3: &Client, db: &str, file: &str, threads: u64) -> io::Result<()>
         }
     }
     out.sync_all()?;
-    drop(out);
-    let sum = digest(file)?;
-    if m.synced.as_deref() != Some(sum.as_str()) {
-        let mut pinned = m.clone();
-        pinned.synced = Some(sum);
-        let json = serde_json::to_vec(&pinned).map_err(io::Error::other)?;
-        if let Put::PreconditionFailed = s3.put(&store::manifest_key(db), &json, Cond::IfMatch(&snap.etag))? {
-            return Err(io::Error::other(format!(
-                "{file} holds v{}, but s3://{}/{db} changed meanwhile: export again",
-                m.version,
-                s3.bucket()
-            )));
-        }
-    }
-    log::info!("exported v{} in {:.1}s", m.version, started.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -307,7 +323,10 @@ pub fn import(s3: &Client, db: &str, file: &str, replace: bool, chunk_pages: u64
     let chunk_pages = chunk_pages.max(1);
     let chunks = pages.div_ceil(chunk_pages);
     let url = format!("s3://{}/{db}", s3.bucket());
-    s3.create_bucket()?;
+    // A replace finds its bucket there — and a key that may not make buckets.
+    if !replace {
+        s3.create_bucket()?;
+    }
     if !replace && store::fetch_manifest(s3, db)?.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
