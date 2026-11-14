@@ -1,10 +1,8 @@
-<p align="center">
-  <img alt="" src="assets/bucketdb.svg" width="128">
-</p>
+<img src="assets/bucketdb.svg" alt="bucketdb" width="120">
 
-<h1 align="center">bucketdb</h1>
+# bucketdb
 
-<p align="center"><b>A Postgres database that lives in an S3 bucket, served by a sidecar.</b></p>
+**A Postgres database that lives in an S3 bucket, served by a sidecar.**
 
 bucketdb runs beside your app (a container, a VM, a Lambda extension) and speaks the
 Postgres wire protocol on `localhost`. Your app connects with the driver and ORM it
