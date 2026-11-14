@@ -283,11 +283,23 @@ impl Client {
     /// On network errors, or a refusal other than the bucket existing already.
     pub fn create_bucket(&self) -> io::Result<()> {
         let path = self.path("");
+        // Outside us-east-1, S3 wants the region in the body, and answers a request
+        // without it with 400 even for a bucket that exists.
+        let body = if self.cfg.region == "us-east-1" {
+            String::new()
+        } else {
+            format!(
+                "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <LocationConstraint>{}</LocationConstraint></CreateBucketConfiguration>",
+                self.cfg.region
+            )
+        };
+        let hash = hex::encode(digest::digest(&digest::SHA256, body.as_bytes()));
         let mut req = self.agent.put(self.url(&path));
-        for (k, v) in self.sign("PUT", &path, EMPTY_SHA256) {
+        for (k, v) in self.sign("PUT", &path, &hash) {
             req = req.header(k, v);
         }
-        let mut res = req.send_empty().map_err(io::Error::other)?;
+        let mut res = req.send(body.as_bytes()).map_err(io::Error::other)?;
         match res.status().as_u16() {
             200 | 409 => Ok(()),
             s => Err(status_error("PUT bucket", &self.cfg.bucket, s, &mut res)),
