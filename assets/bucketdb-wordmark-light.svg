@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 256" role="img" aria-labelledby="t">
+  <title id="t">bucketdb</title>
+  <defs>
+    <linearGradient id="bdb-body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#1D4ED8"/>
+    </linearGradient>
+    <linearGradient id="bdb-fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#E0F2FE"/>
+      <stop offset="1" stop-color="#7DD3FC"/>
+    </linearGradient>
+    <clipPath id="bdb-clip">
+      <path d="M44 84 L68 214 A60 16 0 0 0 188 214 L212 84 Z"/>
+    </clipPath>
+  </defs>
+  <!-- handle -->
+  <path d="M52 84 C52 20 204 20 204 84" fill="none" stroke="#1E3A8A" stroke-width="12" stroke-linecap="round"/>
+  <!-- body: a bucket that is also a database cylinder -->
+  <path d="M44 84 L68 214 A60 16 0 0 0 188 214 L212 84 Z" fill="url(#bdb-body)"/>
+  <!-- the disks of the database, following the taper -->
+  <g clip-path="url(#bdb-clip)" fill="none" stroke="#FFFFFF" stroke-opacity=".85" stroke-width="7">
+    <path d="M40 124 A88 21 0 0 0 216 124"/>
+    <path d="M40 164 A88 19 0 0 0 216 164"/>
+  </g>
+  <!-- rim, with the data inside -->
+  <ellipse cx="128" cy="84" rx="84" ry="22" fill="url(#bdb-fill)" stroke="#1E3A8A" stroke-width="8"/>
+  <ellipse cx="128" cy="86" rx="58" ry="11" fill="#38BDF8" fill-opacity=".55"/>
+  <text x="270" y="172" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="132" font-weight="700" letter-spacing="-4" fill="#0F172A">bucket<tspan fill="#1D4ED8">db</tspan></text>
+</svg>

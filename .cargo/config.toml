@@ -1,0 +1,4 @@
+[env]
+# Lets the VFS commit a transaction as one write: SQLite keeps the rollback journal
+# in memory and hands the pages over between BEGIN and COMMIT_ATOMIC_WRITE.
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_BATCH_ATOMIC_WRITE -DSQLITE_ENABLE_MATH_FUNCTIONS"

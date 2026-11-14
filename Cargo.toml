@@ -1,0 +1,98 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/kernia/bucketdb"
+publish = false
+
+[workspace.dependencies]
+bucketdb-postgres = { path = "crates/postgres" }
+bucketdb-storage = { path = "crates/storage" }
+# SQLite runs the SQL; bucketdb adds the VFS that keeps the file in a bucket.
+rusqlite = { version = "0.40", features = ["bundled", "functions", "column_decltype"] }
+# Postgres SQL to an AST, rewritten for SQLite. Pure Rust.
+sqlparser = { version = "0.64", default-features = false, features = ["std", "visitor"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# SHA-256 and HMAC for SigV4 and file digests: ring, which rustls already links
+# (hardware-accelerated).
+ring = "0.17"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+log = { version = "0.4", features = ["std"] }
+# statvfs, for the disk cache's default size in Lambda (already under rusqlite).
+libc = "0.2"
+
+[package]
+name = "bucketdb"
+description = "A Postgres database that lives in an S3 bucket, served by a sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bucketdb-postgres.workspace = true
+bucketdb-storage.workspace = true
+ureq.workspace = true
+chrono.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# The wire format, SQLite's API and S3 sizes convert between integer widths on
+# every line; the formats say the sizes.
+cast_lossless = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# SQL keywords, S3 and Postgres names fill the docs; backticks on all read worse.
+doc_markdown = "allow"
+needless_raw_string_hashes = "allow"
+# #[must_use] goes by hand where dropping the value is a bug.
+must_use_candidate = "allow"
+# Wire readers name their cursors i, b, p.
+many_single_char_names = "allow"
+similar_names = "allow"
+# OIDs and SQLite codes are compared with the docs as written.
+unreadable_literal = "allow"
+items_after_statements = "allow"
+too_many_lines = "allow"
+format_push_string = "allow"
+# Signatures shaped by callbacks: SQLite functions and the VFS's C entry points.
+unnecessary_wraps = "allow"
+needless_pass_by_value = "allow"
+match_same_arms = "allow"
+# Restriction lints that hold the server paths to account.
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+
+# As small as it goes: the sidecar ships beside every app.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = 0
