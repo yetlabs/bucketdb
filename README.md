@@ -32,6 +32,33 @@ per-tenant or per-app databases, functions that need SQL without a server.
 **Not for** high write throughput: every commit is two S3 PUTs (~20-50 commits/s on
 AWS S3 across all sidecars of a database).
 
+## Install
+
+Each `v*` tag publishes static binaries (Linux built against musl, so no libc to
+match) to the [releases](https://github.com/yetlabs/bucketdb/releases):
+
+```sh
+# linux-amd64, linux-arm64, darwin-amd64, darwin-arm64
+curl -fsSLo bucketdb https://github.com/yetlabs/bucketdb/releases/latest/download/bucketdb-linux-arm64
+chmod +x bucketdb
+```
+
+And an image, `ghcr.io/yetlabs/bucketdb` (linux/amd64 and linux/arm64), that holds
+the binary and nothing else: `FROM scratch`, ~5 MB, the TLS roots compiled in.
+
+```sh
+docker run --rm -p 5432:5432 -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e BUCKETDB_S3_REGION \
+  ghcr.io/yetlabs/bucketdb serve --host 0.0.0.0 s3://my-bucket/app
+```
+
+As a sidecar (a Kubernetes pod, an ECS task) the default `127.0.0.1` is the one to
+keep: the app shares its network. In a Lambda container image, copy it in as an
+extension:
+
+```dockerfile
+COPY --from=ghcr.io/yetlabs/bucketdb:latest /bucketdb /opt/extensions/bucketdb
+```
+
 ## Quick start
 
 ```sh
@@ -188,7 +215,7 @@ It shares the function's memory, so in Lambda the defaults follow
 The disk cache is not a copy of the database: one sparse file per bucket object,
 holding only the pages read, and wiped when the extension starts.
 
-Build for Lambda (arm64; use an amd64 machine or `--platform` for x86_64):
+Or build it for Lambda yourself (arm64; use an amd64 machine or `--platform` for x86_64):
 
 ```sh
 podman run --rm -v $PWD:/src -w /src rust:1-alpine sh -c 'apk add musl-dev && cargo build --release'

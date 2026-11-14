@@ -1,0 +1,156 @@
+name: release
+
+# A v* tag publishes the binaries to a GitHub release and the image to
+# ghcr.io/yetlabs/bucketdb. Run by hand, it only builds the binaries: a dry run.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # A tag publishes nothing ci.yml has not passed: the tagged commit must be one
+  # pushed to main, whose ci.yml run this waits for instead of running it again.
+  ci-passed:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # The binary reports Cargo.toml's version: the tag must say the same.
+      - name: tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "${GITHUB_REF_NAME}" = "v$version" ] || { echo "tag ${GITHUB_REF_NAME}, Cargo.toml $version"; exit 1; }
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Up to 30 minutes: the tag may be pushed right behind its commit.
+          for _ in $(seq 90); do
+            state=$(gh run list -R "$REPO" --workflow ci.yml --event push --commit "$SHA" \
+              --json status,conclusion -q '.[0] | "\(.status) \(.conclusion)"')
+            case "$state" in
+              "completed success") echo "ci.yml passed on $SHA"; exit 0 ;;
+              completed*) echo "ci.yml on $SHA: $state"; exit 1 ;;
+              "") echo "no ci.yml run for $SHA yet (a tag must point at a commit pushed to main)" ;;
+              *) echo "ci.yml on $SHA: $state" ;;
+            esac
+            sleep 20
+          done
+          exit 1
+
+  # Each architecture builds on its own runner, no cross compiler. Linux links musl
+  # statically: no libc to match, and the image can be the binary alone (the TLS
+  # roots are compiled in, webpki-roots). The builds run beside ci-passed; only
+  # what publishes needs both.
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     target: x86_64-unknown-linux-musl,  name: bucketdb-linux-amd64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: bucketdb-linux-arm64 }
+          - { os: macos-latest,     target: x86_64-apple-darwin,        name: bucketdb-darwin-amd64 }
+          - { os: macos-latest,     target: aarch64-apple-darwin,       name: bucketdb-darwin-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # SQLite and ring are C: compiled for musl with musl-gcc.
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          echo "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=musl-gcc" >> "$GITHUB_ENV"
+      - name: build
+        run: |
+          set -eu
+          cargo build --release --target "${{ matrix.target }}"
+          mkdir dist
+          # A bare binary, not an archive: one file to download and run. No version
+          # in the name, so releases/latest/download/<name> always resolves.
+          cp "target/${{ matrix.target }}/release/bucketdb" "dist/${{ matrix.name }}"
+          ls -l dist
+          if [ "$RUNNER_OS" = Linux ]; then file dist/*; ! ldd dist/* 2>/dev/null | grep -q '=>'; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  publish:
+    needs: [ci-passed, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          ls -l
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  # The image is the Linux release binaries in an empty image: no second compile.
+  # It publishes as ghcr.io/yetlabs/bucketdb with the workflow's own GITHUB_TOKEN.
+  image:
+    needs: [ci-passed, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bucketdb-linux-*
+          path: dist
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        env:
+          # Annotations on the multi-arch index too, not only on each image.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ghcr.io/yetlabs/bucketdb
+          # v1.2.3 publishes 1.2.3, 1.2, and latest.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+          # The source label links the package to this repository on GitHub, so
+          # its page shows the README and inherits the repository's access.
+          labels: |
+            org.opencontainers.image.source=https://github.com/yetlabs/bucketdb
+            org.opencontainers.image.title=bucketdb
+            org.opencontainers.image.description=A Postgres database that lives in an S3 bucket, served by a sidecar
+          annotations: |
+            org.opencontainers.image.source=https://github.com/yetlabs/bucketdb
+            org.opencontainers.image.title=bucketdb
+            org.opencontainers.image.description=A Postgres database that lives in an S3 bucket, served by a sidecar
+      - uses: docker/build-push-action@v6
+        with:
+          context: dist
+          file: .github/release.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # A multi-arch push is an index: its annotations, not the per-image
+          # labels, are what ghcr.io reads for the package's source and description.
+          annotations: ${{ steps.meta.outputs.annotations }}
