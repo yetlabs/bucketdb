@@ -1,6 +1,6 @@
 [package]
 name = "bucketdb-storage"
-description = "The storage side of bucketdb: a SQLite database file kept in an S3 bucket"
+description = "The storage side of BucketDB: a SQLite database file kept in an S3 bucket"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

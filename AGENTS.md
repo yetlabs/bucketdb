@@ -32,7 +32,7 @@ MinIO and a sidecar from `run-local.sh` (see README.md).
 
 ## Principles
 
-- bucketdb must stay as small as possible: no new dependency without a strong
+- BucketDB must stay as small as possible: no new dependency without a strong
   reason, no AWS SDK (the S3 client is hand-written SigV4), the release binary
   is built for size.
 - Every `unsafe` block carries a `// SAFETY:` comment saying why it holds.

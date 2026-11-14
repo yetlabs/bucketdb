@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 800" width="1280" height="800">
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#1E3A8A"/></marker></defs>
 <rect width="1280" height="800" fill="#FFFFFF"/>
-<text x="40" y="58" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="30" font-weight="700" fill="#0F172A" text-anchor="start">How bucketdb works</text>
+<text x="40" y="58" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="30" font-weight="700" fill="#0F172A" text-anchor="start">How BucketDB works</text>
 <text x="40" y="88" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="17" font-weight="400" fill="#475569" text-anchor="start">A Postgres-speaking sidecar whose database lives in an S3 bucket: no database server to run.</text>
 <rect x="40" y="200" width="250" height="150" rx="14" fill="#F8FAFC" stroke="#94A3B8" stroke-width="2"/>
 <text x="165" y="240" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#0F172A" text-anchor="middle">Your app</text>
@@ -13,7 +13,7 @@
 <text x="331" y="258" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1E3A8A" text-anchor="middle">Postgres</text>
 <text x="331" y="322" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="14" font-weight="400" fill="#1E3A8A" text-anchor="middle">wire v3</text>
 <rect x="380" y="130" width="400" height="500" rx="18" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2.5"/>
-<text x="404" y="168" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#0F172A" text-anchor="start">bucketdb sidecar</text>
+<text x="404" y="168" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#0F172A" text-anchor="start">BucketDB sidecar</text>
 <text x="404" y="192" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="13.5" font-weight="400" fill="#475569" text-anchor="start">beside the app: a container, a VM, a Lambda extension</text>
 <rect x="404" y="216" width="352" height="66" rx="10" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
 <text x="424" y="244" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="17" font-weight="700" fill="#0F172A" text-anchor="start">Postgres protocol</text>

@@ -1,6 +1,6 @@
 [package]
 name = "bucketdb-postgres"
-description = "The Postgres side of bucketdb: wire protocol v3 and Postgres SQL rewritten for SQLite"
+description = "The Postgres side of BucketDB: wire protocol v3 and Postgres SQL rewritten for SQLite"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

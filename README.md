@@ -1,10 +1,10 @@
-<img src="assets/bucketdb.svg" alt="bucketdb" width="120">
+<img src="assets/bucketdb.svg" alt="BucketDB" width="120">
 
-# bucketdb
+# BucketDB
 
 **A Postgres database that lives in an S3 bucket, served by a sidecar.**
 
-bucketdb runs beside your app (a container, a VM, a Lambda extension) and speaks the
+BucketDB runs beside your app (a container, a VM, a Lambda extension) and speaks the
 Postgres wire protocol on `localhost`. Your app connects with the driver and ORM it
 already uses (pgx, GORM, psql, Prisma...) and writes Postgres SQL. Underneath, the
 database is a set of immutable objects in a bucket: there is no database server to
@@ -12,7 +12,7 @@ run, patch, scale or pay for while idle. Many sidecars can serve the same databa
 the bucket's conditional writes order their commits.
 
 <p align="center">
-  <img alt="How bucketdb works" src="assets/architecture.png" width="100%">
+  <img alt="How BucketDB works" src="assets/architecture.png" width="100%">
 </p>
 
 Inside, one small binary (4.7 MB on macOS, ~5 MB static for Linux):
@@ -65,7 +65,7 @@ psql postgres://postgres@localhost:5432/app -c 'select count(*) from users'
   it gets `40001 serialization_failure` and runs again, as ORMs do on their own. To
   know what a transaction read, each one sees its own change counter in page 1, so
   SQLite drops its page cache at every start and every page comes through the VFS
-  (from bucketdb's cache). A
+  (from BucketDB's cache). A
   transaction too big for SQLite's cache spills to a local rollback journal; then the
   sync of the main file commits (a rollback's playback, equal to the snapshot, sends
   nothing).
@@ -166,7 +166,7 @@ memory).
 
 ## AWS Lambda
 
-bucketdb runs as an external extension: put the binary at `/opt/extensions/bucketdb`
+BucketDB runs as an external extension: put the binary at `/opt/extensions/bucketdb`
 (a layer, or `COPY` in a container image) and set `BUCKETDB_DATABASES=s3://bucket/app` plus the
 S3 variables (in AWS, the function role's credentials are already in the environment).
 Lambda starts it before the function with no arguments; it opens `127.0.0.1:5432`,
@@ -195,8 +195,8 @@ podman run --rm -v $PWD:/src -w /src rust:1-alpine sh -c 'apk add musl-dev && ca
 ```
 
 Tested in the Lambda runtime interface emulator (`public.ecr.aws/lambda/python:3.12`,
-bucketdb in `/opt/extensions`, pg8000 in the function) over the 38 GB CNPJ
-database in MinIO: init 53 ms, first lookup 36 ms, cached 0.4 ms, bucketdb's RSS 7 MB.
+BucketDB in `/opt/extensions`, pg8000 in the function) over the 38 GB CNPJ
+database in MinIO: init 53 ms, first lookup 36 ms, cached 0.4 ms, BucketDB's RSS 7 MB.
 
 `cargo build --release`: opt-level s, fat LTO, stripped.
 
