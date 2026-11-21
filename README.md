@@ -153,14 +153,24 @@ numeric, timestamptz, uuid defaults, ILIKE, LIMIT/OFFSET.
 `serve` opens a second port, 6379 (`--redis-port`, `REDIS_PORT`; 0 turns it off),
 over the same database. RESP2, so redis-cli, go-redis, redis-py and the like:
 
-- Keys live in `bucketdb_kv`, a table of the database: a write command is a
-  transaction, committed in the bucket before its reply, as an SQL commit is. The
-  table stays out of the catalogs (`\dt`, AutoMigrate) but SQL can read it.
+- Keys live in `bucketdb_kv`, a table of the database: a write command is
+  committed in the bucket before its reply, as an SQL commit is. The table stays
+  out of the catalogs (`\dt`, AutoMigrate) but SQL can read it.
+- Group commit: write commands go through one writer per database, each in a
+  savepoint of its own, and those that arrive while a commit is out to the bucket
+  go out together in the next one. One connection writes at the pace of one commit;
+  many write about as many times faster, at the latency of about two commits.
+  With S3's latency simulated over MinIO (a commit ~95 ms), 16 connections doing
+  `SET` wrote 104 keys/s (p99 221 ms) where one commit per command gave 10 (p99
+  22 s). A commit carries at most 1024 commands, and half of `BUCKETDB_MAX_TXN_MB`
+  of arguments.
 - Expiry is by time: every read filters on the key's `expires_at`, so a key is
   gone the moment it expires, and a read never writes. The clock is the sidecar's;
   across sidecars TTLs are as exact as their clocks are in step.
-- A write that loses its commit to another sidecar runs again on its own (a client
-  never sees a 40001); after 8 tries it answers `TRYAGAIN`.
+- A write that loses its commit to another sidecar runs again on its own, with the
+  rest of its commit (a client never sees a 40001); after 8 tries it answers
+  `TRYAGAIN`. `INFO` shows the selected database's `bucketdb_commits` and
+  `bucketdb_writes`.
 - Commands: `GET`, `SET` (`EX PX EXAT PXAT NX XX KEEPTTL GET`), `SETNX`, `SETEX`,
   `PSETEX`, `GETDEL`, `GETEX`, `MGET`, `MSET`, `MSETNX`, `DEL`, `UNLINK`, `EXISTS`,
   `TYPE`, `STRLEN`, `APPEND`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `EXPIRE`,
@@ -290,8 +300,8 @@ See [AGENTS.md](AGENTS.md) for the conventions (English, Conventional Commits).
 
 ## Not yet
 
-- Redis: hashes, `SCAN`/`KEYS`, a sweep of expired rows, commands from many
-  connections grouped into one commit; no pub/sub, blocking commands or Lua.
+- Redis: hashes, `SCAN`/`KEYS`, a sweep of expired rows; no pub/sub, blocking
+  commands or Lua.
 - CHECK constraints in `\d table`, and psql's other `\d` commands (functions, types, roles).
 - Arrays, interval arithmetic, COPY, LISTEN/NOTIFY, generate_series.
 - A foreign key or check added with ALTER TABLE is accepted but not enforced

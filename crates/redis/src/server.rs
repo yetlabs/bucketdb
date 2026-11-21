@@ -1,6 +1,8 @@
-//! The server: a thread per connection, each with its own SQLite connections.
+//! The server: a thread per connection, each with its own SQLite connections to
+//! read, and one writer per database that all of them write through.
 
 use crate::cmd::{self, Error, Store};
+use crate::group::{RETRIES, Writer, lost_race, now_ms};
 use crate::resp::{self, Limits, Reply};
 use rusqlite::Connection;
 use std::io::{self, BufReader, BufWriter, Write};
@@ -8,13 +10,10 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// The version clients are told: the commands here are Redis 7.2's.
 const REDIS_VERSION: &str = "7.2.0";
-
-/// How many times a write runs again after losing its commit to another sidecar.
-const RETRIES: usize = 8;
 
 #[derive(Debug)]
 pub struct Config {
@@ -76,16 +75,26 @@ pub fn prepare(cfg: &Config) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// When accepting a connection fails.
+/// When a database cannot be opened, or accepting a connection fails.
 pub fn serve(listener: TcpListener, cfg: Arc<Config>) -> io::Result<()> {
+    let mut writers = Vec::new();
+    if !cfg.read_only {
+        for (name, path) in &cfg.dbs {
+            let conn = open(path, false).map_err(|e| io::Error::other(format!("{name}: {e}")))?;
+            // Half the transaction limit: room for the pages around the values.
+            writers.push(Writer::new(conn, cfg.max_command_bytes / 2));
+        }
+    }
+    let writers = Arc::new(writers);
     for stream in listener.incoming() {
         let stream = stream?;
         let cfg = cfg.clone();
+        let writers = writers.clone();
         std::thread::spawn(move || {
             let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
             let _slot = Slot;
             let full = ACTIVE.fetch_add(1, Ordering::Relaxed) >= cfg.max_connections;
-            if let Err(e) = Session::run(stream, &cfg, full)
+            if let Err(e) = Session::run(stream, &cfg, &writers, full)
                 && e.kind() != io::ErrorKind::UnexpectedEof
             {
                 log::debug!("bucketdb: redis connection {peer}: {e}");
@@ -114,19 +123,11 @@ fn open(path: &std::path::Path, read_only: bool) -> rusqlite::Result<Connection>
     Ok(conn)
 }
 
-/// A commit that lost to another writer (SQLITE_BUSY_SNAPSHOT): run it again.
-fn lost_race(e: &rusqlite::Error) -> bool {
-    matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.extended_code == 517)
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
-}
-
 struct Session<'a> {
     cfg: &'a Config,
+    writers: &'a [Writer],
+    /// The size of the command being run, for its commit's share.
+    bytes: usize,
     id: i64,
     db: usize,
     conns: Vec<Option<Connection>>,
@@ -135,7 +136,7 @@ struct Session<'a> {
 }
 
 impl Session<'_> {
-    fn run(stream: TcpStream, cfg: &Config, full: bool) -> io::Result<()> {
+    fn run(stream: TcpStream, cfg: &Config, writers: &[Writer], full: bool) -> io::Result<()> {
         let _ = stream.set_nodelay(true);
         let mut out = BufWriter::new(stream.try_clone()?);
         if full {
@@ -149,6 +150,8 @@ impl Session<'_> {
         };
         let mut s = Session {
             cfg,
+            writers,
+            bytes: 0,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             db: 0,
             conns: cfg.dbs.iter().map(|_| None).collect(),
@@ -169,6 +172,7 @@ impl Session<'_> {
                 continue;
             }
             let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+            s.bytes = args.iter().map(Vec::len).sum();
             let reply = s.dispatch(&name, &args[1..]);
             reply.write(&mut out)?;
             if name == "QUIT" {
@@ -218,14 +222,18 @@ impl Session<'_> {
                 Some(sub) if sub == "COUNT" => Reply::Int(0),
                 _ => Reply::Array(vec![]),
             },
-            "INFO" => Reply::Bulk(
-                format!(
-                    "# Server\r\nredis_version:{REDIS_VERSION}\r\nredis_mode:standalone\r\n\
-                     bucketdb_version:{}\r\n",
-                    env!("CARGO_PKG_VERSION")
+            "INFO" => {
+                let (commits, writes) = self.writers.get(self.db).map_or((0, 0), Writer::stats);
+                Reply::Bulk(
+                    format!(
+                        "# Server\r\nredis_version:{REDIS_VERSION}\r\nredis_mode:standalone\r\n\
+                         bucketdb_version:{}\r\n\r\n# Stats\r\nbucketdb_commits:{commits}\r\n\
+                         bucketdb_writes:{writes}\r\n",
+                        env!("CARGO_PKG_VERSION")
+                    )
+                    .into_bytes(),
                 )
-                .into_bytes(),
-            ),
+            }
             _ => cmd::run(self, name, args).unwrap_or_else(|| {
                 let mut shown = String::new();
                 for a in args.iter().take(3) {
@@ -362,28 +370,9 @@ impl Store for Session<'_> {
                 "READONLY You can't write against a read only replica.".into(),
             ));
         }
-        let c = self.conn()?;
-        for _ in 0..RETRIES {
-            // IMMEDIATE: the write lock first, so no other connection of this
-            // process commits under it; only another sidecar can.
-            c.execute_batch("BEGIN IMMEDIATE")?;
-            let r = f(c, now_ms()).and_then(|v| c.execute_batch("COMMIT").map(|()| v).map_err(Error::Sql));
-            match r {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    // A failed COMMIT leaves the transaction open.
-                    if !c.is_autocommit() {
-                        let _ = c.execute_batch("ROLLBACK");
-                    }
-                    match e {
-                        Error::Sql(e) if lost_race(&e) => {}
-                        e => return Err(e),
-                    }
-                }
-            }
-        }
-        Err(Error::Reply(
-            "TRYAGAIN another writer committed first; try again".into(),
-        ))
+        let Some(w) = self.writers.get(self.db) else {
+            return Err(Error::Reply("ERR no writer for this database".into()));
+        };
+        w.write(f, self.bytes)
     }
 }

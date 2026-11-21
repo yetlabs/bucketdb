@@ -162,13 +162,18 @@ fn read_only() {
 #[test]
 fn concurrent_writers() {
     let addr = start(None, 1, false);
-    let threads: Vec<_> = (0..4)
-        .map(|_| {
+    assert_eq!(Client::new(&addr).cmd(&["SET", "s", "abc"]), "+OK");
+    let threads: Vec<_> = (0..8)
+        .map(|i| {
             let addr = addr.clone();
             std::thread::spawn(move || {
                 let c = &mut Client::new(&addr);
                 for _ in 0..50 {
                     assert!(c.cmd(&["INCR", "n"]).starts_with(':'));
+                    // A command that fails, in the same commits as the others.
+                    if i == 0 {
+                        assert_eq!(c.cmd(&["INCR", "s"]), "-ERR value is not an integer or out of range");
+                    }
                 }
             })
         })
@@ -176,5 +181,16 @@ fn concurrent_writers() {
     for t in threads {
         t.join().unwrap();
     }
-    assert_eq!(Client::new(&addr).cmd(&["GET", "n"]), "\"200\"");
+    let c = &mut Client::new(&addr);
+    assert_eq!(c.cmd(&["GET", "n"]), "\"400\"");
+    assert_eq!(c.cmd(&["GET", "s"]), "\"abc\"");
+    // Commands that arrived together went out together.
+    let info = c.cmd(&["INFO"]);
+    let stat = |k: &str| -> u64 {
+        let line = info.split("\\r\\n").find(|l| l.starts_with(k)).unwrap();
+        line[k.len() + 1..].parse().unwrap()
+    };
+    let (commits, writes) = (stat("bucketdb_commits"), stat("bucketdb_writes"));
+    assert_eq!(writes, 1 + 400 + 50);
+    assert!(commits < writes, "{commits} commits for {writes} writes");
 }
