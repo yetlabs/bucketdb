@@ -167,17 +167,26 @@ over the same database. RESP2, so redis-cli, go-redis, redis-py and the like:
 - Expiry is by time: every read filters on the key's `expires_at`, so a key is
   gone the moment it expires, and a read never writes. The clock is the sidecar's;
   across sidecars TTLs are as exact as their clocks are in step.
+- The rows of expired keys are deleted every `BUCKETDB_REDIS_SWEEP_SECONDS` (60;
+  0: never), up to 1000 a commit, through the same writer. A read finds first
+  whether there are any, so a database where nothing expires is never written.
 - A write that loses its commit to another sidecar runs again on its own, with the
   rest of its commit (a client never sees a 40001); after 8 tries it answers
-  `TRYAGAIN`. `INFO` shows the selected database's `bucketdb_commits` and
-  `bucketdb_writes`.
+  `TRYAGAIN`. `INFO` shows the selected database's `bucketdb_commits`,
+  `bucketdb_writes` and `expired_keys` (rows swept).
 - Commands: `GET`, `SET` (`EX PX EXAT PXAT NX XX KEEPTTL GET`), `SETNX`, `SETEX`,
   `PSETEX`, `GETDEL`, `GETEX`, `MGET`, `MSET`, `MSETNX`, `DEL`, `UNLINK`, `EXISTS`,
   `TYPE`, `STRLEN`, `APPEND`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `EXPIRE`,
   `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` (`NX XX GT LT`), `TTL`, `PTTL`, `PERSIST`,
-  `DBSIZE`; and `PING`, `ECHO`, `AUTH` (`BUCKETDB_PASSWORD`), `HELLO 2`, `SELECT n`
+  `EXPIRETIME`, `PEXPIRETIME`, `DBSIZE`, `SCAN` (`MATCH COUNT TYPE`), `KEYS`,
+  `RENAME`, `RENAMENX`, `RANDOMKEY`, `FLUSHDB`; and `PING`, `ECHO`, `AUTH` (`BUCKETDB_PASSWORD`), `HELLO 2`, `SELECT n`
   (the nth database served), `CLIENT`, `INFO`, `QUIT`.
-- Under `serve --at`, reads work and writes get `READONLY`.
+- `SCAN` walks the keys in byte order from where it stopped, so a key present
+  from start to end comes back exactly once. Cursors are kept by the sidecar
+  (the last 10,000), and any of its connections may go on with one. A pattern's
+  literal prefix (`session:*`) reads only that range of keys; `KEYS` too.
+- Under `serve --at`, reads work and writes get `READONLY`, and keys expire as
+  they had at that moment: the one given, or the version's commit for an id.
 
 It is a durable key-value store, not a cache: a write costs what a commit costs
 (two PUTs, tens of milliseconds on S3), and writes share the database's commits
@@ -300,8 +309,7 @@ See [AGENTS.md](AGENTS.md) for the conventions (English, Conventional Commits).
 
 ## Not yet
 
-- Redis: hashes, `SCAN`/`KEYS`, a sweep of expired rows; no pub/sub, blocking
-  commands or Lua.
+- Redis: hashes, `FLUSHALL`; no pub/sub, blocking commands or Lua.
 - CHECK constraints in `\d table`, and psql's other `\d` commands (functions, types, roles).
 - Arrays, interval arithmetic, COPY, LISTEN/NOTIFY, generate_series.
 - A foreign key or check added with ALTER TABLE is accepted but not enforced

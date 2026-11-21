@@ -1,5 +1,5 @@
 //! The server over TCP, on a plain SQLite file (no bucket): the protocol,
-//! connection commands, pipelining and concurrent writers.
+//! connection commands, pipelining, concurrent writers, the sweep and SCAN.
 
 #![allow(clippy::unwrap_used)]
 
@@ -9,8 +9,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn start(password: Option<&str>, dbs: usize, read_only: bool) -> String {
-    // Tests run in parallel: each its own files.
+/// A new directory for a test's databases: tests run in parallel.
+fn new_dir() -> std::path::PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "bucketdb-redis-{}-{}",
@@ -19,20 +19,43 @@ fn start(password: Option<&str>, dbs: usize, read_only: bool) -> String {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let cfg = Config {
+    dir
+}
+
+fn config(dir: &std::path::Path, dbs: usize) -> Config {
+    Config {
         dbs: (0..dbs)
             .map(|i| (format!("db{i}"), dir.join(format!("db{i}.sqlite"))))
             .collect(),
-        password: password.map(Into::into),
+        password: None,
         max_connections: 16,
-        read_only,
+        read_only: false,
         max_command_bytes: 1 << 20,
-    };
+        at: None,
+        sweep: None,
+    }
+}
+
+fn serve_on(cfg: Config) -> String {
     prepare(&cfg).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || serve(listener, Arc::new(cfg)));
     addr
+}
+
+fn start(password: Option<&str>, dbs: usize, read_only: bool) -> String {
+    let mut cfg = config(&new_dir(), dbs);
+    cfg.password = password.map(Into::into);
+    cfg.read_only = read_only;
+    serve_on(cfg)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 struct Client {
@@ -193,4 +216,66 @@ fn concurrent_writers() {
     let (commits, writes) = (stat("bucketdb_commits"), stat("bucketdb_writes"));
     assert_eq!(writes, 1 + 400 + 50);
     assert!(commits < writes, "{commits} commits for {writes} writes");
+}
+
+#[test]
+fn sweeps_expired_rows() {
+    let mut cfg = config(&new_dir(), 1);
+    cfg.sweep = Some(std::time::Duration::from_millis(20));
+    let addr = serve_on(cfg);
+    let c = &mut Client::new(&addr);
+    assert_eq!(c.cmd(&["SET", "a", "1", "PX", "1"]), "+OK");
+    assert_eq!(c.cmd(&["SET", "b", "2", "PX", "1"]), "+OK");
+    assert_eq!(c.cmd(&["SET", "c", "3"]), "+OK");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if c.cmd(&["INFO"]).contains("expired_keys:2") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no sweep: {}", c.cmd(&["INFO"]));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(c.cmd(&["DBSIZE"]), ":1");
+    assert_eq!(c.cmd(&["GET", "c"]), "\"3\"");
+}
+
+#[test]
+fn reads_the_past_at_its_moment() {
+    let dir = new_dir();
+    let writer = serve_on(config(&dir, 1));
+    let t = now_ms() + 60_000;
+    let c = &mut Client::new(&writer);
+    assert_eq!(c.cmd(&["SET", "k", "v", "PXAT", &t.to_string()]), "+OK");
+    // Read only, a moment before the key expires and one after.
+    for (at, want) in [(t - 1, "\"v\""), (t, "nil")] {
+        let mut cfg = config(&dir, 1);
+        cfg.read_only = true;
+        cfg.at = Some(at);
+        let c = &mut Client::new(&serve_on(cfg));
+        assert_eq!(c.cmd(&["GET", "k"]), want);
+    }
+    let mut cfg = config(&dir, 1);
+    cfg.read_only = true;
+    cfg.at = Some(t - 1000);
+    let c = &mut Client::new(&serve_on(cfg));
+    assert_eq!(c.cmd(&["PTTL", "k"]), ":1000");
+}
+
+#[test]
+fn scan_cursors_go_across_connections() {
+    let addr = start(None, 2, false);
+    let a = &mut Client::new(&addr);
+    for i in 0..5 {
+        assert_eq!(a.cmd(&["SET", &format!("k{i}"), "v"]), "+OK");
+    }
+    a.send(&["SCAN", "0", "COUNT", "3"]);
+    assert_eq!(a.r.by_ref().lines().next().unwrap().unwrap(), "*2");
+    let cursor = a.reply().trim_matches('"').to_string();
+    assert_eq!(a.reply(), "[\"k0\", \"k1\", \"k2\"]");
+    // Another connection of the pool goes on with it.
+    let b = &mut Client::new(&addr);
+    assert_eq!(b.cmd(&["SCAN", &cursor, "COUNT", "3"]), "[\"0\", [\"k3\", \"k4\"]]");
+    // Not in another database.
+    assert_eq!(b.cmd(&["SELECT", "1"]), "+OK");
+    assert_eq!(b.cmd(&["SCAN", &cursor]), "-ERR invalid cursor");
 }

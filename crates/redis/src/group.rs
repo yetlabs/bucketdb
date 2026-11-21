@@ -35,6 +35,8 @@ pub struct Writer {
     max_bytes: usize,
     commits: AtomicU64,
     writes: AtomicU64,
+    /// Rows of expired keys the sweep deleted.
+    expired: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -106,15 +108,22 @@ impl Writer {
             max_bytes: max_bytes.max(1),
             commits: AtomicU64::new(0),
             writes: AtomicU64::new(0),
+            expired: AtomicU64::new(0),
         }
     }
 
-    /// Commits so far, and the write commands they carried.
-    pub fn stats(&self) -> (u64, u64) {
+    /// Commits so far, the write commands they carried, and the rows of expired
+    /// keys swept.
+    pub fn stats(&self) -> (u64, u64, u64) {
         (
             self.commits.load(Ordering::Relaxed),
             self.writes.load(Ordering::Relaxed),
+            self.expired.load(Ordering::Relaxed),
         )
+    }
+
+    pub fn add_expired(&self, n: u64) {
+        self.expired.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Runs f in the next commit and returns once that commit is in the bucket.

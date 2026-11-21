@@ -49,7 +49,8 @@ Lambda: run with no arguments as /opt/extensions/bucketdb; serves BUCKETDB_DATAB
 Tuning: BUCKETDB_CACHE_MB (64), BUCKETDB_READAHEAD (16 pages),
         BUCKETDB_STALENESS_MS (1000), BUCKETDB_CHUNK_PAGES (256), BUCKETDB_LOG (info),
         BUCKETDB_DISK_CACHE_DIR, BUCKETDB_DISK_CACHE_MB (1024),
-        BUCKETDB_COMPACT_SEGMENTS (100), BUCKETDB_GRACE_SECONDS (600)";
+        BUCKETDB_COMPACT_SEGMENTS (100), BUCKETDB_GRACE_SECONDS (600),
+        BUCKETDB_REDIS_SWEEP_SECONDS (60; 0: expired keys' rows are kept)";
 
 fn main() {
     Logger::init();
@@ -226,6 +227,8 @@ fn serve(args: &[String]) -> Result<()> {
     let paths = vfs::placeholders(Path::new(&dir), &names)?;
     let mut served = Vec::new();
     let mut rdbs = Vec::new();
+    // The moment a version of the past is seen at, for the keys' TTLs.
+    let mut at_ms = None;
     for (remote, path) in remotes.iter().zip(&paths) {
         let s3 = if let Some((_, c)) = clients.iter().find(|(b, _)| *b == remote.bucket) {
             c.clone()
@@ -240,7 +243,8 @@ fn serve(args: &[String]) -> Result<()> {
         // A version of the past: read only, as it was.
         let rdb = Arc::new(match &at {
             Some(when) => {
-                let snap = past::at(&s3, &remote.db, when)?;
+                let (snap, moment) = past::at_moment(&s3, &remote.db, when)?;
+                at_ms.get_or_insert(moment);
                 log::info!("{}: v{}, as of {when}, read only", remote.name, snap.manifest.version);
                 store::RemoteDb::open_pinned(&remote.db, s3, store::Options::from_env(), snap)?
             }
@@ -273,6 +277,10 @@ fn serve(args: &[String]) -> Result<()> {
             max_connections,
             read_only: at.is_some(),
             max_command_bytes: store::Options::from_env().max_txn_bytes() as usize,
+            at: at_ms,
+            sweep: Some(env_num("BUCKETDB_REDIS_SWEEP_SECONDS", 60))
+                .filter(|s| *s > 0)
+                .map(Duration::from_secs),
         };
         redis::prepare(&cfg)?;
         let cfg = Arc::new(cfg);

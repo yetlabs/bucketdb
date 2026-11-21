@@ -3,13 +3,15 @@
 
 use crate::cmd::{self, Error, Store};
 use crate::group::{RETRIES, Writer, lost_race, now_ms};
+use crate::keys;
 use crate::resp::{self, Limits, Reply};
 use rusqlite::Connection;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 /// The version clients are told: the commands here are Redis 7.2's.
@@ -26,6 +28,31 @@ pub struct Config {
     pub read_only: bool,
     /// Bytes one command's arguments may carry together.
     pub max_command_bytes: usize,
+    /// The moment a version of the past is read at, in milliseconds since the
+    /// epoch: keys expire as they had then. None: now.
+    pub at: Option<i64>,
+    /// How often the rows of expired keys are deleted. None: never.
+    pub sweep: Option<Duration>,
+}
+
+/// SCAN cursors kept: past that many, the oldest go (a client that comes back
+/// with one gets "invalid cursor").
+const MAX_CURSORS: usize = 10_000;
+
+/// Where SCANs stopped, by cursor: (database, last key). Any connection may go on
+/// with a cursor another one got, as client pools do.
+#[derive(Debug, Default)]
+struct Cursors {
+    next: u64,
+    keys: HashMap<u64, (usize, Vec<u8>)>,
+    order: VecDeque<u64>,
+}
+
+/// What the connections share.
+#[derive(Debug)]
+struct Shared {
+    writers: Vec<Writer>,
+    cursors: Mutex<Cursors>,
 }
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -85,16 +112,26 @@ pub fn serve(listener: TcpListener, cfg: Arc<Config>) -> io::Result<()> {
             writers.push(Writer::new(conn, cfg.max_command_bytes / 2));
         }
     }
-    let writers = Arc::new(writers);
+    let shared = Arc::new(Shared {
+        writers,
+        cursors: Mutex::new(Cursors::default()),
+    });
+    if let Some(every) = cfg.sweep {
+        for (i, (name, path)) in cfg.dbs.iter().enumerate().take(shared.writers.len()) {
+            let reader = open(path, true).map_err(|e| io::Error::other(format!("{name}: {e}")))?;
+            let (shared, name) = (shared.clone(), name.clone());
+            std::thread::spawn(move || sweeper(&shared.writers[i], &reader, &name, every));
+        }
+    }
     for stream in listener.incoming() {
         let stream = stream?;
         let cfg = cfg.clone();
-        let writers = writers.clone();
+        let shared = shared.clone();
         std::thread::spawn(move || {
             let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
             let _slot = Slot;
             let full = ACTIVE.fetch_add(1, Ordering::Relaxed) >= cfg.max_connections;
-            if let Err(e) = Session::run(stream, &cfg, &writers, full)
+            if let Err(e) = Session::run(stream, &cfg, &shared, full)
                 && e.kind() != io::ErrorKind::UnexpectedEof
             {
                 log::debug!("bucketdb: redis connection {peer}: {e}");
@@ -102,6 +139,40 @@ pub fn serve(listener: TcpListener, cfg: Arc<Config>) -> io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// Deletes the rows of expired keys, every so often, through the writer: a read
+/// finds whether there are any, so an idle database is never written. Every
+/// sidecar sweeps; two at once lose a race and the loser finds nothing left.
+fn sweeper(writer: &Writer, reader: &Connection, name: &str, every: Duration) {
+    // Sidecars started together sweep apart.
+    let jitter = now_ms().unsigned_abs() % every.as_millis().max(1) as u64;
+    std::thread::sleep(Duration::from_millis(jitter));
+    loop {
+        loop {
+            match keys::expired(reader, now_ms()) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    log::error!("bucketdb: redis sweep {name}: {e}");
+                    break;
+                }
+            }
+            match writer.write(&mut |c, now| Ok(keys::sweep(c, now)?), 0) {
+                Ok(n) => {
+                    writer.add_expired(n as u64);
+                    if n < keys::SWEEP_BATCH {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::error!("bucketdb: redis sweep {name}: {e:?}");
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(every);
+    }
 }
 
 fn open(path: &std::path::Path, read_only: bool) -> rusqlite::Result<Connection> {
@@ -126,6 +197,7 @@ fn open(path: &std::path::Path, read_only: bool) -> rusqlite::Result<Connection>
 struct Session<'a> {
     cfg: &'a Config,
     writers: &'a [Writer],
+    cursors: &'a Mutex<Cursors>,
     /// The size of the command being run, for its commit's share.
     bytes: usize,
     id: i64,
@@ -136,7 +208,7 @@ struct Session<'a> {
 }
 
 impl Session<'_> {
-    fn run(stream: TcpStream, cfg: &Config, writers: &[Writer], full: bool) -> io::Result<()> {
+    fn run(stream: TcpStream, cfg: &Config, shared: &Shared, full: bool) -> io::Result<()> {
         let _ = stream.set_nodelay(true);
         let mut out = BufWriter::new(stream.try_clone()?);
         if full {
@@ -150,7 +222,8 @@ impl Session<'_> {
         };
         let mut s = Session {
             cfg,
-            writers,
+            writers: &shared.writers,
+            cursors: &shared.cursors,
             bytes: 0,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             db: 0,
@@ -223,12 +296,12 @@ impl Session<'_> {
                 _ => Reply::Array(vec![]),
             },
             "INFO" => {
-                let (commits, writes) = self.writers.get(self.db).map_or((0, 0), Writer::stats);
+                let (commits, writes, expired) = self.writers.get(self.db).map_or((0, 0, 0), Writer::stats);
                 Reply::Bulk(
                     format!(
                         "# Server\r\nredis_version:{REDIS_VERSION}\r\nredis_mode:standalone\r\n\
                          bucketdb_version:{}\r\n\r\n# Stats\r\nbucketdb_commits:{commits}\r\n\
-                         bucketdb_writes:{writes}\r\n",
+                         bucketdb_writes:{writes}\r\nexpired_keys:{expired}\r\n",
                         env!("CARGO_PKG_VERSION")
                     )
                     .into_bytes(),
@@ -356,12 +429,35 @@ fn arity(name: &str) -> Reply {
 
 impl Store for Session<'_> {
     fn read<T>(&mut self, f: &mut dyn FnMut(&Connection, i64) -> Result<T, Error>) -> Result<T, Error> {
+        let now = self.cfg.at.unwrap_or_else(now_ms);
         let c = self.conn()?;
         // One snapshot for all the command reads.
         c.execute_batch("BEGIN")?;
-        let r = f(c, now_ms());
+        let r = f(c, now);
         let _ = c.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" });
         r
+    }
+
+    fn save_cursor(&mut self, last: Vec<u8>) -> u64 {
+        let mut c = self.cursors.lock().unwrap_or_else(PoisonError::into_inner);
+        c.next += 1;
+        let id = c.next;
+        c.keys.insert(id, (self.db, last));
+        c.order.push_back(id);
+        while c.order.len() > MAX_CURSORS {
+            if let Some(old) = c.order.pop_front() {
+                c.keys.remove(&old);
+            }
+        }
+        id
+    }
+
+    fn load_cursor(&mut self, cursor: u64) -> Option<Vec<u8>> {
+        let c = self.cursors.lock().unwrap_or_else(PoisonError::into_inner);
+        c.keys
+            .get(&cursor)
+            .filter(|(db, _)| *db == self.db)
+            .map(|(_, k)| k.clone())
     }
 
     fn write<T>(&mut self, f: &mut dyn FnMut(&Connection, i64) -> Result<T, Error>) -> Result<T, Error> {

@@ -9,6 +9,7 @@
 
 mod cmd;
 mod group;
+mod keys;
 mod resp;
 mod server;
 

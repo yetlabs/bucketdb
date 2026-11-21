@@ -5,6 +5,7 @@
 //! or not its row is still there. Reads never delete; a write over an expired key
 //! takes it as absent and replaces its row.
 
+use crate::keys;
 use crate::resp::Reply;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -21,13 +22,13 @@ pub const TEMP_SCHEMA: &str = "CREATE TEMP TABLE IF NOT EXISTS bucketdb_kv (
   key BLOB PRIMARY KEY, type INTEGER NOT NULL, value BLOB NOT NULL, expires_at INTEGER
 ) WITHOUT ROWID;";
 
-const STRING: i64 = 0;
+pub(crate) const STRING: i64 = 0;
 
-const LIVE: &str = "(expires_at IS NULL OR expires_at > ?2)";
+pub(crate) const LIVE: &str = "(expires_at IS NULL OR expires_at > ?2)";
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 const NOT_INT: &str = "ERR value is not an integer or out of range";
-const SYNTAX: &str = "ERR syntax error";
+pub(crate) const SYNTAX: &str = "ERR syntax error";
 
 /// A command's failure: a reply for the client, or SQLite's.
 #[derive(Debug)]
@@ -42,7 +43,7 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-fn fail<T>(msg: impl Into<String>) -> Result<T, Error> {
+pub(crate) fn fail<T>(msg: impl Into<String>) -> Result<T, Error> {
     Err(Error::Reply(msg.into()))
 }
 
@@ -63,16 +64,23 @@ pub trait Store {
     ///
     /// What f returns, a commit that failed, or a read-only database.
     fn write<T>(&mut self, f: &mut dyn FnMut(&Connection, i64) -> Result<T, Error>) -> Result<T, Error>;
+
+    /// Keeps where a SCAN stopped (the last key it went past) and names it with
+    /// a cursor, never 0: clients take cursors as numbers, keys are bytes.
+    fn save_cursor(&mut self, last: Vec<u8>) -> u64;
+
+    /// The key a cursor names, None when it names none (or no longer).
+    fn load_cursor(&mut self, cursor: u64) -> Option<Vec<u8>>;
 }
 
 #[derive(Debug)]
-struct Entry {
-    kind: i64,
-    value: Vec<u8>,
-    expires_at: Option<i64>,
+pub(crate) struct Entry {
+    pub kind: i64,
+    pub value: Vec<u8>,
+    pub expires_at: Option<i64>,
 }
 
-fn entry(c: &Connection, key: &[u8], now: i64) -> rusqlite::Result<Option<Entry>> {
+pub(crate) fn entry(c: &Connection, key: &[u8], now: i64) -> rusqlite::Result<Option<Entry>> {
     c.prepare_cached(&format!(
         "SELECT type, value, expires_at FROM bucketdb_kv WHERE key = ?1 AND {LIVE}"
     ))?
@@ -118,7 +126,7 @@ fn set_expiry(c: &Connection, key: &[u8], expires_at: Option<i64>) -> rusqlite::
 }
 
 /// An integer as Redis takes one: an optional minus, digits, no leading zeros.
-fn int(arg: &[u8]) -> Option<i64> {
+pub(crate) fn int(arg: &[u8]) -> Option<i64> {
     let digits = arg.strip_prefix(b"-").unwrap_or(arg);
     if digits.is_empty()
         || digits.len() > 19
@@ -171,7 +179,7 @@ impl Expiry {
     }
 }
 
-fn upper(arg: &[u8]) -> String {
+pub(crate) fn upper(arg: &[u8]) -> String {
     String::from_utf8_lossy(arg).to_ascii_uppercase()
 }
 
@@ -193,7 +201,11 @@ pub fn run(s: &mut impl Store, name: &str, args: &[Vec<u8>]) -> Option<Reply> {
         "SETEX" | "PSETEX" => (3, false),
         "MSET" | "MSETNX" => (2, true),
         "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => (2, true),
-        "DBSIZE" => (0, false),
+        "DBSIZE" | "RANDOMKEY" => (0, false),
+        "FLUSHDB" => (0, true),
+        "KEYS" | "EXPIRETIME" | "PEXPIRETIME" => (1, false),
+        "SCAN" => (1, true),
+        "RENAME" | "RENAMENX" => (2, false),
         _ => return None,
     };
     if args.len() < min || (!more && args.len() > min) || (name.starts_with("MSET") && args.len() % 2 == 1) {
@@ -225,6 +237,14 @@ pub fn run(s: &mut impl Store, name: &str, args: &[Vec<u8>]) -> Option<Reply> {
         "TTL" => ttl(s, &args[0], true),
         "PTTL" => ttl(s, &args[0], false),
         "PERSIST" => persist(s, &args[0]),
+        "EXPIRETIME" => expiretime(s, &args[0], true),
+        "PEXPIRETIME" => expiretime(s, &args[0], false),
+        "SCAN" => keys::scan(s, args),
+        "KEYS" => keys::keys(s, &args[0]),
+        "RENAME" => keys::rename(s, &args[0], &args[1], false),
+        "RENAMENX" => keys::rename(s, &args[0], &args[1], true),
+        "RANDOMKEY" => keys::random(s),
+        "FLUSHDB" => keys::flush(s, args),
         _ => dbsize(s),
     };
     Some(match result {
@@ -540,6 +560,21 @@ fn persist(s: &mut impl Store, key: &[u8]) -> Result<Reply, Error> {
     })
 }
 
+fn expiretime(s: &mut impl Store, key: &[u8], seconds: bool) -> Result<Reply, Error> {
+    s.read(&mut |c, now| {
+        Ok(Reply::Int(match entry(c, key, now)? {
+            None => -2,
+            Some(Entry { expires_at: None, .. }) => -1,
+            Some(Entry {
+                expires_at: Some(t), ..
+            }) if seconds => t / 1000,
+            Some(Entry {
+                expires_at: Some(t), ..
+            }) => t,
+        }))
+    })
+}
+
 fn dbsize(s: &mut impl Store) -> Result<Reply, Error> {
     s.read(&mut |c, now| {
         let n = c
@@ -550,14 +585,15 @@ fn dbsize(s: &mut impl Store) -> Result<Reply, Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A plain SQLite connection and a clock the test moves.
-    struct Mem {
-        conn: Connection,
-        now: i64,
+    pub(crate) struct Mem {
+        pub conn: Connection,
+        pub now: i64,
         writes: usize,
+        cursors: Vec<Vec<u8>>,
     }
 
     impl Store for Mem {
@@ -572,25 +608,35 @@ mod tests {
             self.conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
             r
         }
+
+        fn save_cursor(&mut self, last: Vec<u8>) -> u64 {
+            self.cursors.push(last);
+            self.cursors.len() as u64
+        }
+
+        fn load_cursor(&mut self, cursor: u64) -> Option<Vec<u8>> {
+            self.cursors.get(usize::try_from(cursor).ok()?.checked_sub(1)?).cloned()
+        }
     }
 
-    fn mem() -> Mem {
+    pub(crate) fn mem() -> Mem {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
         Mem {
             conn,
             now: 1_000_000,
             writes: 0,
+            cursors: Vec::new(),
         }
     }
 
-    fn cmd(s: &mut Mem, line: &str) -> Reply {
+    pub(crate) fn cmd(s: &mut Mem, line: &str) -> Reply {
         let mut args: Vec<Vec<u8>> = line.split(' ').map(|a| a.as_bytes().to_vec()).collect();
         let name = upper(&args.remove(0));
         run(s, &name, &args).unwrap_or_else(|| panic!("unknown {name}"))
     }
 
-    fn bulk(v: &str) -> Reply {
+    pub(crate) fn bulk(v: &str) -> Reply {
         Reply::Bulk(v.as_bytes().to_vec())
     }
 
