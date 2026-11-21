@@ -11,6 +11,9 @@ database is a set of immutable objects in a bucket: there is no database server 
 run, patch, scale or pay for while idle. Many sidecars can serve the same database;
 the bucket's conditional writes order their commits.
 
+The same sidecar speaks Redis too, on a second port: keys with TTLs for sessions,
+flags and locks, kept in a table of the same database, so in the same bucket.
+
 <p align="center">
   <img alt="How BucketDB works" src="assets/architecture.png" width="100%">
 </p>
@@ -66,7 +69,7 @@ cargo build --release
 export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...   # BUCKETDB_S3_ENDPOINT for MinIO, R2...
 
 bucketdb import app.sqlite s3://my-bucket/app     # or: bucketdb create s3://my-bucket/app
-bucketdb serve s3://my-bucket/app                 # postgres://localhost:5432/app
+bucketdb serve s3://my-bucket/app                 # postgres://localhost:5432/app, redis://localhost:6379
 psql postgres://postgres@localhost:5432/app -c 'select count(*) from users'
 ```
 
@@ -144,6 +147,32 @@ Tested with GORM over pgx: a Go API, unchanged, answers byte for byte as on a
 regular server over a 38 GB database; `tests/gorm` runs AutoMigrate
 (create, no-op, add column), CRUD, Preload, a nested transaction (savepoint),
 numeric, timestamptz, uuid defaults, ILIKE, LIMIT/OFFSET.
+
+## The Redis side
+
+`serve` opens a second port, 6379 (`--redis-port`, `REDIS_PORT`; 0 turns it off),
+over the same database. RESP2, so redis-cli, go-redis, redis-py and the like:
+
+- Keys live in `bucketdb_kv`, a table of the database: a write command is a
+  transaction, committed in the bucket before its reply, as an SQL commit is. The
+  table stays out of the catalogs (`\dt`, AutoMigrate) but SQL can read it.
+- Expiry is by time: every read filters on the key's `expires_at`, so a key is
+  gone the moment it expires, and a read never writes. The clock is the sidecar's;
+  across sidecars TTLs are as exact as their clocks are in step.
+- A write that loses its commit to another sidecar runs again on its own (a client
+  never sees a 40001); after 8 tries it answers `TRYAGAIN`.
+- Commands: `GET`, `SET` (`EX PX EXAT PXAT NX XX KEEPTTL GET`), `SETNX`, `SETEX`,
+  `PSETEX`, `GETDEL`, `GETEX`, `MGET`, `MSET`, `MSETNX`, `DEL`, `UNLINK`, `EXISTS`,
+  `TYPE`, `STRLEN`, `APPEND`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `EXPIRE`,
+  `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` (`NX XX GT LT`), `TTL`, `PTTL`, `PERSIST`,
+  `DBSIZE`; and `PING`, `ECHO`, `AUTH` (`BUCKETDB_PASSWORD`), `HELLO 2`, `SELECT n`
+  (the nth database served), `CLIENT`, `INFO`, `QUIT`.
+- Under `serve --at`, reads work and writes get `READONLY`.
+
+It is a durable key-value store, not a cache: a write costs what a commit costs
+(two PUTs, tens of milliseconds on S3), and writes share the database's commits
+with SQL. Reads come from the page cache. A key read soon after a write on another
+sidecar may lag by up to `BUCKETDB_STALENESS_MS`.
 
 ## Use
 
@@ -261,6 +290,8 @@ See [AGENTS.md](AGENTS.md) for the conventions (English, Conventional Commits).
 
 ## Not yet
 
+- Redis: hashes, `SCAN`/`KEYS`, a sweep of expired rows, commands from many
+  connections grouped into one commit; no pub/sub, blocking commands or Lua.
 - CHECK constraints in `\d table`, and psql's other `\d` commands (functions, types, roles).
 - Arrays, interval arithmetic, COPY, LISTEN/NOTIFY, generate_series.
 - A foreign key or check added with ALTER TABLE is accepted but not enforced

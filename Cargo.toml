@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 bucketdb-postgres = { path = "crates/postgres" }
+bucketdb-redis = { path = "crates/redis" }
 bucketdb-storage = { path = "crates/storage" }
 # SQLite runs the SQL; bucketdb adds the VFS that keeps the file in a bucket.
 rusqlite = { version = "0.40", features = ["bundled", "functions", "column_decltype"] }
@@ -43,6 +44,7 @@ publish.workspace = true
 
 [dependencies]
 bucketdb-postgres.workspace = true
+bucketdb-redis.workspace = true
 bucketdb-storage.workspace = true
 serde_json.workspace = true
 ureq.workspace = true

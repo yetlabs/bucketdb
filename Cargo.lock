@@ -34,6 +34,7 @@ name = "bucketdb"
 version = "0.3.0"
 dependencies = [
  "bucketdb-postgres",
+ "bucketdb-redis",
  "bucketdb-storage",
  "chrono",
  "log",
@@ -52,6 +53,14 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "sqlparser",
+]
+
+[[package]]
+name = "bucketdb-redis"
+version = "0.3.0"
+dependencies = [
+ "log",
+ "rusqlite",
 ]
 
 [[package]]

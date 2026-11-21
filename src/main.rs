@@ -1,13 +1,15 @@
 //! bucketdb: a Postgres database that lives in an S3 bucket, served by a sidecar.
 //!
-//! The command line over the two libraries: [`bucketdb_postgres`] speaks the
-//! Postgres protocol and runs the SQL on SQLite, [`bucketdb_storage`] keeps the
-//! SQLite file in a bucket. A database is always written `s3://bucket/path`;
+//! The command line over the libraries: [`bucketdb_postgres`] speaks the Postgres
+//! protocol and runs the SQL on SQLite, [`bucketdb_redis`] speaks Redis's over a
+//! table of the same database, [`bucketdb_storage`] keeps the SQLite file in a
+//! bucket. A database is always written `s3://bucket/path`;
 //! anything else is a local file.
 
 mod lambda;
 
 use bucketdb_postgres as postgres;
+use bucketdb_redis as redis;
 use bucketdb_storage::{Remote, env_num, lambda_memory_mb, past, store, sync, vfs};
 use std::path::Path;
 use std::sync::Arc;
@@ -28,18 +30,21 @@ const USAGE: &str = "usage:
   bucketdb upsert <base.sqlite> <updated.sqlite> s3://bucket/db
                                                    commit the pages updated changed;
                                                    base must be what the bucket holds
-  bucketdb serve [--host H] [--port P] [--dir D] [--create] [--at WHEN] s3://bucket/db...
-                                                   (--create: an empty one where none is;
-                                                   --at: a version of the past, read only)
+  bucketdb serve [--host H] [--port P] [--redis-port P] [--dir D] [--create] [--at WHEN]
+                 s3://bucket/db...                 Postgres on 5432 and Redis on 6379
+                                                   (--redis-port 0: no Redis; --create: an
+                                                   empty one where none is; --at: a version
+                                                   of the past, read only)
   bucketdb create s3://bucket/db                   an empty database
   bucketdb compact s3://bucket/db
 
 S3: BUCKETDB_S3_ENDPOINT (AWS when unset), BUCKETDB_S3_REGION,
     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
-Auth: BUCKETDB_PASSWORD (any user; trust when unset)
+Ports: POSTGRES_PORT (5432), REDIS_PORT (6379; SELECT n is the nth database)
+Auth: BUCKETDB_PASSWORD (any user; trust when unset), for both
 Limits: BUCKETDB_MAX_CONNECTIONS (64), BUCKETDB_MAX_TXN_MB (256)
 Lambda: run with no arguments as /opt/extensions/bucketdb; serves BUCKETDB_DATABASES
-        (s3://bucket/a,s3://bucket/b) on 127.0.0.1:5432; cache, transaction limit, disk cache in /tmp
+        (s3://bucket/a,s3://bucket/b) on 127.0.0.1:5432 and :6379; cache, transaction limit, disk cache in /tmp
         and connection limit follow the function's memory unless set
 Tuning: BUCKETDB_CACHE_MB (64), BUCKETDB_READAHEAD (16 pages),
         BUCKETDB_STALENESS_MS (1000), BUCKETDB_CHUNK_PAGES (256), BUCKETDB_LOG (info),
@@ -184,6 +189,7 @@ fn upsert(base: &str, updated: &str, url: &str) -> Result<()> {
 fn serve(args: &[String]) -> Result<()> {
     let mut host = "127.0.0.1".to_string();
     let mut port = env_num("POSTGRES_PORT", 5432) as u16;
+    let mut redis_port = env_num("REDIS_PORT", 6379) as u16;
     let lambda = lambda::active();
     let default_dir = if lambda.is_some() {
         "/tmp/bucketdb/db"
@@ -199,6 +205,7 @@ fn serve(args: &[String]) -> Result<()> {
         match a.as_str() {
             "--host" => host.clone_from(it.next().ok_or("--host needs a value")?),
             "--port" => port = it.next().ok_or("--port needs a value")?.parse()?,
+            "--redis-port" => redis_port = it.next().ok_or("--redis-port needs a value")?.parse()?,
             "--dir" => dir.clone_from(it.next().ok_or("--dir needs a value")?),
             "--create" => create = true,
             "--at" => at = Some(it.next().ok_or("--at needs a version or a moment")?.clone()),
@@ -246,31 +253,46 @@ fn serve(args: &[String]) -> Result<()> {
     vfs::register(served)?;
 
     let addr = format!("{host}:{port}");
-    // A restart may find the port still held a moment by the process before.
-    let mut tries = 0;
-    let listener = loop {
-        match std::net::TcpListener::bind(&addr) {
-            Ok(l) => break l,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 40 => {
-                tries += 1;
-                std::thread::sleep(Duration::from_millis(250));
+    let listener = listen(&addr)?;
+    let password = std::env::var("BUCKETDB_PASSWORD").ok().filter(|p| !p.is_empty());
+    // ~2 MB of SQLite cache and a thread each; in Lambda, one per 32 MB.
+    let max_connections = env_num(
+        "BUCKETDB_MAX_CONNECTIONS",
+        lambda_memory_mb().map_or(64, |m| (m / 32).clamp(8, 64)),
+    )
+    .max(1) as usize;
+    // Redis: the same databases, SELECT n the nth; open (and its table made)
+    // before the function's init may go on.
+    let mut redis_addr = None;
+    if redis_port != 0 {
+        let addr = format!("{host}:{redis_port}");
+        let listener = listen(&addr)?;
+        let cfg = redis::Config {
+            dbs: names.iter().cloned().zip(paths.iter().cloned()).collect(),
+            password: password.clone(),
+            max_connections,
+            read_only: at.is_some(),
+            max_command_bytes: store::Options::from_env().max_txn_bytes() as usize,
+        };
+        redis::prepare(&cfg)?;
+        let cfg = Arc::new(cfg);
+        std::thread::spawn(move || {
+            if let Err(e) = redis::serve(listener, cfg) {
+                log::error!("bucketdb: redis: {e}");
+                std::process::exit(1);
             }
-            Err(e) => return Err(format!("listen {addr}: {e}").into()),
-        }
-    };
+        });
+        redis_addr = Some(addr);
+    }
     let cfg = Arc::new(postgres::Config {
         dbs: names.iter().cloned().zip(paths.iter().cloned()).collect(),
-        password: std::env::var("BUCKETDB_PASSWORD").ok().filter(|p| !p.is_empty()),
-        // ~2 MB of SQLite cache and a thread each; in Lambda, one per 32 MB.
-        max_connections: env_num(
-            "BUCKETDB_MAX_CONNECTIONS",
-            lambda_memory_mb().map_or(64, |m| (m / 32).clamp(8, 64)),
-        )
-        .max(1) as usize,
+        password,
+        max_connections,
         read_only: at.is_some(),
     });
+    let redis_on = redis_addr.map_or(String::new(), |a| format!(", redis on {a}"));
     log::info!(
-        "bucketdb {}: postgres on {addr} -> {}",
+        "bucketdb {}: postgres on {addr}{redis_on} -> {}",
         env!("CARGO_PKG_VERSION"),
         names.join(", ")
     );
@@ -319,6 +341,22 @@ fn serve(args: &[String]) -> Result<()> {
     }
     postgres::serve(listener, cfg)?;
     Ok(())
+}
+
+/// Listens on addr. A restart may find the port still held a moment by the
+/// process before.
+fn listen(addr: &str) -> Result<std::net::TcpListener> {
+    let mut tries = 0;
+    loop {
+        match std::net::TcpListener::bind(addr) {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 40 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => return Err(format!("listen {addr}: {e}").into()),
+        }
+    }
 }
 
 struct Logger {
