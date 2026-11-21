@@ -184,7 +184,8 @@ over the same database. RESP2, so redis-cli, go-redis, redis-py and the like:
   `HSTRLEN`, `HINCRBY`, `HINCRBYFLOAT`, `HSCAN` (`MATCH COUNT NOVALUES`);
   transactions: `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`; and `PING`,
   `ECHO`, `AUTH` (`BUCKETDB_PASSWORD`), `HELLO 2`, `SELECT n` (the nth database
-  served), `CLIENT`, `INFO`, `QUIT`.
+  served), `CLIENT`, `INFO`, `QUIT`; `COMMAND DOCS` and `COUNT` say these, so
+  redis-cli's help, hints and Tab complete what it speaks, and nothing else.
 - A hash's fields live in `bucketdb_kv_hash`, its type and TTL in its key's row,
   so it expires, is renamed, swept and deleted as any key; one left with no
   fields is deleted.

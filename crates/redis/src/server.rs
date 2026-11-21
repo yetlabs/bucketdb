@@ -2,6 +2,7 @@
 //! read, and one writer per database that all of them write through.
 
 use crate::cmd::{self, Error, Store};
+use crate::docs;
 use crate::group::{RETRIES, Writer, lost_race, now_ms};
 use crate::keys;
 use crate::multi;
@@ -326,9 +327,10 @@ impl Session<'_> {
             },
             "HELLO" => self.hello(args),
             "CLIENT" => self.client(args),
-            // Clients (redis-cli) ask for the command table; an empty one is enough.
+            // Clients ask for the command table — redis-cli its docs, for its help, hints and Tab: those it speaks.
             "COMMAND" => match args.first().map(|a| String::from_utf8_lossy(a).to_ascii_uppercase()) {
-                Some(sub) if sub == "COUNT" => Reply::Int(0),
+                Some(sub) if sub == "COUNT" => docs::count(),
+                Some(sub) if sub == "DOCS" => docs::docs(&args[1..]),
                 _ => Reply::Array(vec![]),
             },
             "INFO" => {

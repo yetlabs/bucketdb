@@ -8,6 +8,7 @@
 //! the expiry, so a key is gone the moment it expires, and a read never writes.
 
 mod cmd;
+mod docs;
 mod group;
 mod hash;
 mod keys;
