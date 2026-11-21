@@ -80,18 +80,32 @@ fn manifest_of(s3: &Client, key: &str, v: &Version) -> io::Result<Manifest> {
 ///
 /// When there is none, or on S3 errors.
 pub fn at(s3: &Client, db: &str, when: &str) -> io::Result<Snapshot> {
+    at_moment(s3, db, when).map(|(snap, _)| snap)
+}
+
+/// As [`at`], with the moment the database is seen at, in milliseconds since the
+/// epoch: when's own for a moment, the commit's for a version id. A key with a
+/// TTL is read as it was then.
+///
+/// # Errors
+///
+/// When there is none, or on S3 errors.
+pub fn at_moment(s3: &Client, db: &str, when: &str) -> io::Result<(Snapshot, i64)> {
     let key = store::manifest_key(db);
     let all: Vec<Version> = s3
         .versions(&key)?
         .into_iter()
         .filter(|v| v.key == key && !v.deleted)
         .collect();
-    let chosen = if let Some(v) = all.iter().find(|v| v.version_id == when) {
-        v.clone()
+    let ms = |t: &str| chrono::DateTime::parse_from_rfc3339(t).map(|t| t.timestamp_millis());
+    let (chosen, moment) = if let Some(v) = all.iter().find(|v| v.version_id == when) {
+        let moment = ms(&v.last_modified).map_err(|e| io::Error::other(format!("{}: {e}", v.last_modified)))?;
+        (v.clone(), moment)
     } else {
         let moment = chrono::DateTime::parse_from_rfc3339(when)
             .map_err(|_| io::Error::other(format!("{when}: neither a version id nor a moment (RFC 3339)")))?;
-        all.iter()
+        let v = all
+            .iter()
             .filter(|v| chrono::DateTime::parse_from_rfc3339(&v.last_modified).is_ok_and(|t| t <= moment))
             .max_by(|a, b| a.last_modified.cmp(&b.last_modified))
             .cloned()
@@ -100,10 +114,11 @@ pub fn at(s3: &Client, db: &str, when: &str) -> io::Result<Snapshot> {
                     "s3://{}/{db} keeps no version from {when} or before",
                     s3.bucket()
                 ))
-            })?
+            })?;
+        (v, moment.timestamp_millis())
     };
     let manifest = manifest_of(s3, &key, &chosen)?;
-    Ok(Snapshot::pinned(manifest, chosen.version_id))
+    Ok((Snapshot::pinned(manifest, chosen.version_id), moment))
 }
 
 /// An object a version names — or, deleted since, its version kept by the bucket.
