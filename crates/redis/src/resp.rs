@@ -119,6 +119,8 @@ pub enum Reply {
     Bulk(Vec<u8>),
     Nil,
     Array(Vec<Reply>),
+    /// A null array: an EXEC a watched key aborted.
+    NilArray,
 }
 
 impl Reply {
@@ -150,6 +152,7 @@ impl Reply {
                 w.write_all(b"\r\n")
             }
             Reply::Nil => w.write_all(b"$-1\r\n"),
+            Reply::NilArray => w.write_all(b"*-1\r\n"),
             Reply::Array(items) => {
                 write!(w, "*{}\r\n", items.len())?;
                 items.iter().try_for_each(|i| i.write(w))

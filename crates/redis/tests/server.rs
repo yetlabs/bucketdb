@@ -1,5 +1,6 @@
 //! The server over TCP, on a plain SQLite file (no bucket): the protocol,
-//! connection commands, pipelining, concurrent writers, the sweep and SCAN.
+//! connection commands, pipelining, concurrent writers, the sweep, SCAN and
+//! transactions.
 
 #![allow(clippy::unwrap_used)]
 
@@ -85,7 +86,7 @@ impl Client {
         let line = line.trim_end();
         let (t, rest) = line.split_at(1);
         match t {
-            "$" if rest == "-1" => "nil".into(),
+            "$" | "*" if rest == "-1" => "nil".into(),
             "$" => {
                 let mut b = vec![0; rest.parse::<usize>().unwrap() + 2];
                 self.r.read_exact(&mut b).unwrap();
@@ -278,4 +279,85 @@ fn scan_cursors_go_across_connections() {
     // Not in another database.
     assert_eq!(b.cmd(&["SELECT", "1"]), "+OK");
     assert_eq!(b.cmd(&["SCAN", &cursor]), "-ERR invalid cursor");
+}
+
+#[test]
+fn transactions() {
+    let addr = start(None, 1, false);
+    let c = &mut Client::new(&addr);
+    assert_eq!(c.cmd(&["MULTI"]), "+OK");
+    assert_eq!(c.cmd(&["MULTI"]), "-ERR MULTI calls can not be nested");
+    assert_eq!(c.cmd(&["SET", "a", "1"]), "+QUEUED");
+    assert_eq!(c.cmd(&["INCR", "a"]), "+QUEUED");
+    assert_eq!(c.cmd(&["HSET", "h", "f", "v"]), "+QUEUED");
+    assert_eq!(c.cmd(&["GET", "a"]), "+QUEUED");
+    assert_eq!(c.cmd(&["PING"]), "+QUEUED");
+    assert_eq!(c.cmd(&["EXEC"]), "[+OK, :2, :1, \"2\", +PONG]");
+    // A command refused when queued: nothing runs.
+    assert_eq!(c.cmd(&["MULTI"]), "+OK");
+    assert_eq!(c.cmd(&["SET", "b", "1"]), "+QUEUED");
+    assert_eq!(c.cmd(&["GET"]), "-ERR wrong number of arguments for 'get' command");
+    assert_eq!(
+        c.cmd(&["EXEC"]),
+        "-EXECABORT Transaction discarded because of previous errors."
+    );
+    assert_eq!(c.cmd(&["EXISTS", "b"]), ":0");
+    // A command that fails when run: the others stay.
+    assert_eq!(c.cmd(&["MULTI"]), "+OK");
+    assert_eq!(c.cmd(&["SET", "s", "abc"]), "+QUEUED");
+    assert_eq!(c.cmd(&["INCR", "s"]), "+QUEUED");
+    assert_eq!(c.cmd(&["SET", "t", "1"]), "+QUEUED");
+    assert_eq!(
+        c.cmd(&["EXEC"]),
+        "[+OK, -ERR value is not an integer or out of range, +OK]"
+    );
+    assert_eq!(c.cmd(&["GET", "t"]), "\"1\"");
+    assert_eq!(c.cmd(&["MULTI"]), "+OK");
+    assert_eq!(c.cmd(&["SET", "d", "1"]), "+QUEUED");
+    assert_eq!(c.cmd(&["DISCARD"]), "+OK");
+    assert_eq!(c.cmd(&["EXISTS", "d"]), ":0");
+    assert_eq!(c.cmd(&["EXEC"]), "-ERR EXEC without MULTI");
+    // WATCH: another connection's write aborts the EXEC.
+    let other = &mut Client::new(&addr);
+    assert_eq!(c.cmd(&["WATCH", "a", "h"]), "+OK");
+    assert_eq!(other.cmd(&["HSET", "h", "g", "w"]), ":1");
+    assert_eq!(c.cmd(&["MULTI"]), "+OK");
+    assert_eq!(c.cmd(&["SET", "a", "mine"]), "+QUEUED");
+    assert_eq!(c.cmd(&["EXEC"]), "nil");
+    assert_eq!(c.cmd(&["GET", "a"]), "\"2\"");
+    // Unchanged: it runs.
+    assert_eq!(c.cmd(&["WATCH", "a"]), "+OK");
+    assert_eq!(c.cmd(&["MULTI"]), "+OK");
+    assert_eq!(c.cmd(&["WATCH", "x"]), "-ERR WATCH inside MULTI is not allowed");
+    assert_eq!(c.cmd(&["SET", "a", "mine"]), "+QUEUED");
+    assert_eq!(c.cmd(&["EXEC"]), "[+OK]");
+}
+
+#[test]
+fn optimistic_increments() {
+    let addr = start(None, 1, false);
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let addr = addr.clone();
+            std::thread::spawn(move || {
+                let c = &mut Client::new(&addr);
+                for _ in 0..25 {
+                    // Read, then write only if nobody wrote in between.
+                    loop {
+                        assert_eq!(c.cmd(&["WATCH", "n"]), "+OK");
+                        let n: i64 = c.cmd(&["GET", "n"]).trim_matches('"').parse().unwrap_or(0);
+                        assert_eq!(c.cmd(&["MULTI"]), "+OK");
+                        assert_eq!(c.cmd(&["SET", "n", &(n + 1).to_string()]), "+QUEUED");
+                        if c.cmd(&["EXEC"]) == "[+OK]" {
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(Client::new(&addr).cmd(&["GET", "n"]), "\"200\"");
 }

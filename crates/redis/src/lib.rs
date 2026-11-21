@@ -11,6 +11,7 @@ mod cmd;
 mod group;
 mod hash;
 mod keys;
+mod multi;
 mod resp;
 mod server;
 

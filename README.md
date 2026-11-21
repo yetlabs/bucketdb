@@ -181,8 +181,10 @@ over the same database. RESP2, so redis-cli, go-redis, redis-py and the like:
   `EXPIRETIME`, `PEXPIRETIME`, `DBSIZE`, `SCAN` (`MATCH COUNT TYPE`), `KEYS`,
   `RENAME`, `RENAMENX`, `RANDOMKEY`, `FLUSHDB`; hashes: `HSET`, `HMSET`, `HSETNX`,
   `HGET`, `HMGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS`,
-  `HSTRLEN`, `HINCRBY`, `HINCRBYFLOAT`, `HSCAN` (`MATCH COUNT NOVALUES`); and `PING`, `ECHO`, `AUTH` (`BUCKETDB_PASSWORD`), `HELLO 2`, `SELECT n`
-  (the nth database served), `CLIENT`, `INFO`, `QUIT`.
+  `HSTRLEN`, `HINCRBY`, `HINCRBYFLOAT`, `HSCAN` (`MATCH COUNT NOVALUES`);
+  transactions: `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`; and `PING`,
+  `ECHO`, `AUTH` (`BUCKETDB_PASSWORD`), `HELLO 2`, `SELECT n` (the nth database
+  served), `CLIENT`, `INFO`, `QUIT`.
 - A hash's fields live in `bucketdb_kv_hash`, its type and TTL in its key's row,
   so it expires, is renamed, swept and deleted as any key; one left with no
   fields is deleted.
@@ -190,6 +192,12 @@ over the same database. RESP2, so redis-cli, go-redis, redis-py and the like:
   from start to end comes back exactly once. Cursors are kept by the sidecar
   (the last 10,000), and any of its connections may go on with one. A pattern's
   literal prefix (`session:*`) reads only that range of keys; `KEYS` too.
+- `EXEC` runs its queued commands in one transaction, one commit, each in a
+  savepoint: one that fails leaves the others, as in Redis; a command refused when
+  queued (unknown, wrong arity) discards them all (`EXECABORT`). `WATCH` keeps a
+  fingerprint of each key and `EXEC` compares them inside its transaction, so
+  optimistic locking holds across connections and sidecars; unlike Redis, a key
+  changed and changed back reads as unchanged.
 - Under `serve --at`, reads work and writes get `READONLY`, and keys expire as
   they had at that moment: the one given, or the version's commit for an id.
 

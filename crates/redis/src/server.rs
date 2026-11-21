@@ -4,6 +4,7 @@
 use crate::cmd::{self, Error, Store};
 use crate::group::{RETRIES, Writer, lost_race, now_ms};
 use crate::keys;
+use crate::multi;
 use crate::resp::{self, Limits, Reply};
 use rusqlite::Connection;
 use std::collections::{HashMap, VecDeque};
@@ -42,10 +43,29 @@ const MAX_CURSORS: usize = 10_000;
 /// Where SCANs stopped, by cursor: (database, last key). Any connection may go on
 /// with a cursor another one got, as client pools do.
 #[derive(Debug, Default)]
-struct Cursors {
+pub(crate) struct Cursors {
     next: u64,
     keys: HashMap<u64, (usize, Vec<u8>)>,
     order: VecDeque<u64>,
+}
+
+pub(crate) fn save_cursor(cursors: &Mutex<Cursors>, db: usize, last: Vec<u8>) -> u64 {
+    let mut c = cursors.lock().unwrap_or_else(PoisonError::into_inner);
+    c.next += 1;
+    let id = c.next;
+    c.keys.insert(id, (db, last));
+    c.order.push_back(id);
+    while c.order.len() > MAX_CURSORS {
+        if let Some(old) = c.order.pop_front() {
+            c.keys.remove(&old);
+        }
+    }
+    id
+}
+
+pub(crate) fn load_cursor(cursors: &Mutex<Cursors>, db: usize, cursor: u64) -> Option<Vec<u8>> {
+    let c = cursors.lock().unwrap_or_else(PoisonError::into_inner);
+    c.keys.get(&cursor).filter(|(d, _)| *d == db).map(|(_, k)| k.clone())
 }
 
 /// What the connections share.
@@ -53,17 +73,18 @@ struct Cursors {
 struct Shared {
     writers: Vec<Writer>,
     cursors: Mutex<Cursors>,
+    /// Connections open now.
+    active: AtomicUsize,
 }
 
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ID: AtomicI64 = AtomicI64::new(1);
 
 /// Holds one of max_connections while the session lives.
-struct Slot;
+struct Slot<'a>(&'a AtomicUsize);
 
-impl Drop for Slot {
+impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -115,6 +136,7 @@ pub fn serve(listener: TcpListener, cfg: Arc<Config>) -> io::Result<()> {
     let shared = Arc::new(Shared {
         writers,
         cursors: Mutex::new(Cursors::default()),
+        active: AtomicUsize::new(0),
     });
     if let Some(every) = cfg.sweep {
         for (i, (name, path)) in cfg.dbs.iter().enumerate().take(shared.writers.len()) {
@@ -129,8 +151,8 @@ pub fn serve(listener: TcpListener, cfg: Arc<Config>) -> io::Result<()> {
         let shared = shared.clone();
         std::thread::spawn(move || {
             let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-            let _slot = Slot;
-            let full = ACTIVE.fetch_add(1, Ordering::Relaxed) >= cfg.max_connections;
+            let _slot = Slot(&shared.active);
+            let full = shared.active.fetch_add(1, Ordering::Relaxed) >= cfg.max_connections;
             if let Err(e) = Session::run(stream, &cfg, &shared, full)
                 && e.kind() != io::ErrorKind::UnexpectedEof
             {
@@ -207,6 +229,8 @@ struct Session<'a> {
     conns: Vec<Option<Connection>>,
     authed: bool,
     name: Option<Vec<u8>>,
+    /// MULTI ... EXEC.
+    tx: multi::State,
 }
 
 impl Session<'_> {
@@ -232,6 +256,7 @@ impl Session<'_> {
             conns: cfg.dbs.iter().map(|_| None).collect(),
             authed: cfg.password.is_none(),
             name: None,
+            tx: multi::State::default(),
         };
         loop {
             let args = match resp::read_command(&mut input, limits) {
@@ -264,7 +289,16 @@ impl Session<'_> {
         if !self.authed && !matches!(name, "AUTH" | "HELLO" | "QUIT") {
             return Reply::err("NOAUTH Authentication required.");
         }
+        if self.tx.queueing() && !matches!(name, "EXEC" | "DISCARD" | "MULTI" | "WATCH" | "QUIT") {
+            return self.tx.queue(name, args);
+        }
         match name {
+            "MULTI" => self.tx.multi(),
+            "DISCARD" => self.tx.discard(),
+            "WATCH" if args.is_empty() => arity(name),
+            "WATCH" => self.watch(args),
+            "UNWATCH" => self.tx.unwatch(),
+            "EXEC" => self.exec(),
             "PING" => match args {
                 [] => Reply::Simple("PONG".into()),
                 [msg] => Reply::Bulk(msg.clone()),
@@ -309,18 +343,56 @@ impl Session<'_> {
                     .into_bytes(),
                 )
             }
-            _ => cmd::run(self, name, args).unwrap_or_else(|| {
-                let mut shown = String::new();
-                for a in args.iter().take(3) {
-                    shown.push('\'');
-                    shown.push_str(&String::from_utf8_lossy(a));
-                    shown.push_str("' ");
-                }
-                Reply::err(format!(
-                    "ERR unknown command '{}', with args beginning with: {shown}",
-                    name.to_ascii_lowercase()
-                ))
-            }),
+            _ => cmd::run(self, name, args).unwrap_or_else(|| unknown(name, args)),
+        }
+    }
+
+    /// WATCH key...: what each key holds now, to compare at EXEC.
+    fn watch(&mut self, keys: &[Vec<u8>]) -> Reply {
+        if self.tx.queueing() {
+            return Reply::err("ERR WATCH inside MULTI is not allowed");
+        }
+        for key in keys {
+            match self.read(&mut |c, now| Ok(multi::fingerprint(c, key, now)?)) {
+                Ok(fp) => self.tx.watched.push((self.db, key.clone(), fp)),
+                Err(e) => return cmd::reply(Err(e)),
+            }
+        }
+        Reply::ok()
+    }
+
+    /// EXEC: the queued commands in one transaction, one commit, unless a watched
+    /// key changed (a null reply) or a command was refused when queued.
+    fn exec(&mut self) -> Reply {
+        let (queue, watched) = match self.tx.take() {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        // Keys watched in another database: compared first, by themselves.
+        let db = self.db;
+        for (wdb, key, fp) in watched.iter().filter(|w| w.0 != db) {
+            self.db = *wdb;
+            let now = self.read(&mut |c, now| Ok(multi::fingerprint(c, key, now)?));
+            self.db = db;
+            if now.map_or(true, |n| n != *fp) {
+                return Reply::NilArray;
+            }
+        }
+        let (cursors, read_only) = (self.cursors, self.cfg.read_only);
+        let bytes = queue.iter().map(|(_, a)| a.iter().map(Vec::len).sum::<usize>()).sum();
+        let mut run = |c: &Connection, now: i64| multi::exec(c, now, &queue, &watched, db, read_only, cursors);
+        let result = if read_only {
+            self.read(&mut run)
+        } else {
+            match self.writers.get(db) {
+                Some(w) => w.write(&mut run, bytes),
+                None => Err(Error::Reply("ERR no writer for this database".into())),
+            }
+        };
+        match result {
+            Ok(Some(replies)) => Reply::Array(replies),
+            Ok(None) => Reply::NilArray,
+            Err(e) => cmd::reply(Err(e)),
         }
     }
 
@@ -422,6 +494,19 @@ impl Session<'_> {
     }
 }
 
+pub(crate) fn unknown(name: &str, args: &[Vec<u8>]) -> Reply {
+    let mut shown = String::new();
+    for a in args.iter().take(3) {
+        shown.push('\'');
+        shown.push_str(&String::from_utf8_lossy(a));
+        shown.push_str("' ");
+    }
+    Reply::err(format!(
+        "ERR unknown command '{}', with args beginning with: {shown}",
+        name.to_ascii_lowercase()
+    ))
+}
+
 fn arity(name: &str) -> Reply {
     Reply::err(format!(
         "ERR wrong number of arguments for '{}' command",
@@ -441,25 +526,11 @@ impl Store for Session<'_> {
     }
 
     fn save_cursor(&mut self, last: Vec<u8>) -> u64 {
-        let mut c = self.cursors.lock().unwrap_or_else(PoisonError::into_inner);
-        c.next += 1;
-        let id = c.next;
-        c.keys.insert(id, (self.db, last));
-        c.order.push_back(id);
-        while c.order.len() > MAX_CURSORS {
-            if let Some(old) = c.order.pop_front() {
-                c.keys.remove(&old);
-            }
-        }
-        id
+        save_cursor(self.cursors, self.db, last)
     }
 
     fn load_cursor(&mut self, cursor: u64) -> Option<Vec<u8>> {
-        let c = self.cursors.lock().unwrap_or_else(PoisonError::into_inner);
-        c.keys
-            .get(&cursor)
-            .filter(|(db, _)| *db == self.db)
-            .map(|(_, k)| k.clone())
+        load_cursor(self.cursors, self.db, cursor)
     }
 
     fn write<T>(&mut self, f: &mut dyn FnMut(&Connection, i64) -> Result<T, Error>) -> Result<T, Error> {

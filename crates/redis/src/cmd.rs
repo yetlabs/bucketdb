@@ -300,7 +300,7 @@ pub fn run(s: &mut impl Store, name: &str, args: &[Vec<u8>]) -> Option<Reply> {
     Some(reply(result))
 }
 
-fn reply(result: Result<Reply, Error>) -> Reply {
+pub(crate) fn reply(result: Result<Reply, Error>) -> Reply {
     match result {
         Ok(r) => r,
         Err(Error::Reply(msg)) => Reply::Error(msg),
