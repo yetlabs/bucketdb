@@ -159,7 +159,12 @@ fn named_constraints(sql: &str) -> String {
 /// for (an INTEGER PRIMARY KEY, a WITHOUT ROWID key) gets its table's + 1000000.
 /// Indexes take Postgres' names: t_pkey, t_col_key for a UNIQUE constraint.
 /// The OIDs are CASTs so `oid = '16385'` (as psql writes it) compares as a number.
+/// Tables named `sqlite_*` (SQLite's own) or `bucketdb_*` (BucketDB's, such as the
+/// Redis side's keys) are left out of every view, though SQL can still read them.
 pub const CATALOG: &str = r#"
+CREATE TEMP VIEW pg_bucketdb_rel AS
+  SELECT rowid AS rowid, type, name, sql FROM main.sqlite_master
+  WHERE type IN ('table', 'view') AND substr(name, 1, 7) <> 'sqlite_' AND substr(name, 1, 9) <> 'bucketdb_';
 CREATE TEMP VIEW pg_namespace AS
   SELECT 2200 AS oid, 'public' AS nspname, 10 AS nspowner UNION ALL SELECT 11, 'pg_catalog', 10
   UNION ALL SELECT 13000, 'information_schema', 10;
@@ -178,14 +183,14 @@ CREATE TEMP VIEW pg_bucketdb_index AS
            (SELECT count(*) FROM pragma_index_info(il.name)) AS indnatts,
            CASE WHEN x.sql IS NOT NULL THEN substr(x.sql, instr(x.sql, '('))
              ELSE '(' || (SELECT group_concat(name, ', ') FROM pragma_index_info(il.name)) || ')' END AS keys
-    FROM main.sqlite_master t JOIN pragma_index_list(t.name) il
+    FROM pg_bucketdb_rel t JOIN pragma_index_list(t.name) il
     LEFT JOIN main.sqlite_master x ON x.type = 'index' AND x.name = il.name
-    WHERE t.type = 'table' AND t.name NOT LIKE 'sqlite_%'
+    WHERE t.type = 'table'
     UNION ALL
     SELECT CAST(t.rowid + 16384 + 1000000 AS INTEGER), t.name || '_pkey', t.name, CAST(t.rowid + 16384 AS INTEGER),
            1, 1, 'pk', p.name, p.cid + 1, 1, '(' || p.name || ')'
-    FROM main.sqlite_master t JOIN pragma_table_info(t.name) p
-    WHERE t.type = 'table' AND t.name NOT LIKE 'sqlite_%' AND p.pk = 1 AND upper(p.type) = 'INTEGER'
+    FROM pg_bucketdb_rel t JOIN pragma_table_info(t.name) p
+    WHERE t.type = 'table' AND p.pk = 1 AND upper(p.type) = 'INTEGER'
       AND (SELECT count(*) FROM pragma_table_info(t.name) WHERE pk > 0) = 1
       AND NOT EXISTS (SELECT 1 FROM pragma_index_list(t.name) WHERE origin = 'pk'));
 CREATE TEMP VIEW pg_class AS
@@ -195,12 +200,12 @@ CREATE TEMP VIEW pg_class AS
          EXISTS (SELECT 1 FROM pg_bucketdb_index i WHERE i.tablename = m.name) AS relhasindex,
          10 AS relowner, 0 AS reltablespace, -1 AS reltuples, 0 AS relpages, 0 AS relchecks, 0 AS relhasrules,
          -- Postgres keeps foreign keys as triggers; psql looks for them only then.
-         EXISTS (SELECT 1 FROM pragma_foreign_key_list(m.name)) OR EXISTS (SELECT 1 FROM main.sqlite_master o
+         EXISTS (SELECT 1 FROM pragma_foreign_key_list(m.name)) OR EXISTS (SELECT 1 FROM pg_bucketdb_rel o
            JOIN pragma_foreign_key_list(o.name) f WHERE o.type = 'table' AND f."table" = m.name) AS relhastriggers,
          0 AS relhassubclass, 0 AS relrowsecurity, 0 AS relforcerowsecurity, 0 AS relhasoids,
          0 AS relispartition, 0 AS reloftype, 0 AS reltype, 0 AS reltoastrelid, 'p' AS relpersistence,
          'd' AS relreplident, NULL AS reloptions, NULL AS relpartbound, NULL AS relacl
-  FROM main.sqlite_master m WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%'
+  FROM pg_bucketdb_rel m WHERE m.type IN ('table', 'view')
   UNION ALL
   SELECT i.oid, i.relname, 2200, 'i', 403, i.indnatts, 0, 10, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'p', 'n',
          NULL, NULL, NULL
@@ -223,14 +228,14 @@ CREATE TEMP VIEW pg_constraint AS
          coalesce(pg_fk_name(t.sql, f.id, (SELECT count(DISTINCT id) FROM pragma_foreign_key_list(t.name))),
                   t.name || '_' || group_concat(f."from", '_') || '_fkey'), 2200, 'f', 0, 0, 1,
          CAST(t.rowid + 16384 AS INTEGER), 0, 0, 0,
-         (SELECT CAST(r.rowid + 16384 AS INTEGER) FROM main.sqlite_master r WHERE r.type = 'table' AND r.name = f."table"),
+         (SELECT CAST(r.rowid + 16384 AS INTEGER) FROM pg_bucketdb_rel r WHERE r.type = 'table' AND r.name = f."table"),
          ' ', ' ', ' ', 1, 0, 0, NULL, NULL,
          'FOREIGN KEY (' || group_concat(f."from", ', ') || ') REFERENCES ' || f."table"
            || coalesce('(' || group_concat(f."to", ', ') || ')', '')
            || CASE f.on_update WHEN 'NO ACTION' THEN '' ELSE ' ON UPDATE ' || f.on_update END
            || CASE f.on_delete WHEN 'NO ACTION' THEN '' ELSE ' ON DELETE ' || f.on_delete END
-  FROM main.sqlite_master t JOIN pragma_foreign_key_list(t.name) f
-  WHERE t.type = 'table' AND t.name NOT LIKE 'sqlite_%' GROUP BY t.name, f.id;
+  FROM pg_bucketdb_rel t JOIN pragma_foreign_key_list(t.name) f
+  WHERE t.type = 'table' GROUP BY t.name, f.id;
 CREATE TEMP VIEW pg_am AS
   SELECT 2 AS oid, 'heap' AS amname, 't' AS amtype UNION ALL SELECT 403, 'btree', 'i';
 CREATE TEMP VIEW pg_type AS
@@ -284,7 +289,7 @@ CREATE TEMP VIEW pg_indexes AS
 CREATE TEMP VIEW information_schema_tables AS
   SELECT current_database() AS table_catalog, 'public' AS table_schema, m.name AS table_name,
          CASE m.type WHEN 'view' THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type
-  FROM main.sqlite_master m WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%';
+  FROM pg_bucketdb_rel m WHERE m.type IN ('table', 'view');
 CREATE TEMP VIEW information_schema_columns AS
   SELECT current_database() AS table_catalog, 'public' AS table_schema, m.name AS table_name, p.name AS column_name,
          p.cid + 1 AS ordinal_position, p.dflt_value AS column_default,
@@ -295,23 +300,23 @@ CREATE TEMP VIEW information_schema_columns AS
          pg_num_scale(p.type) AS numeric_scale,
          CASE WHEN pg_udt_name(p.type) LIKE 'timestamp%' THEN 6 END AS datetime_precision,
          NULL AS identity_increment
-  FROM main.sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%';
+  FROM pg_bucketdb_rel m JOIN pragma_table_info(m.name) p WHERE m.type = 'table';
 CREATE TEMP VIEW information_schema_table_constraints AS
   SELECT current_database() AS constraint_catalog, 'public' AS constraint_schema, m.name || '_pkey' AS constraint_name,
          current_database() AS table_catalog, 'public' AS table_schema, m.name AS table_name, 'PRIMARY KEY' AS constraint_type
-  FROM main.sqlite_master m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE pk > 0)
+  FROM pg_bucketdb_rel m WHERE m.type = 'table' AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE pk > 0)
   UNION ALL
   SELECT current_database(), 'public', json_extract(j.value, '$[0]'), current_database(), 'public', m.name,
          json_extract(j.value, '$[1]')
-  FROM main.sqlite_master m JOIN json_each(pg_named_constraints(m.sql)) j
+  FROM pg_bucketdb_rel m JOIN json_each(pg_named_constraints(m.sql)) j
   WHERE m.type = 'table' AND json_extract(j.value, '$[1]') <> 'PRIMARY KEY';
 CREATE TEMP VIEW information_schema_constraint_column_usage AS
   SELECT current_database() AS constraint_catalog, 'public' AS constraint_schema, current_database() AS table_catalog,
          'public' AS table_schema, m.name AS table_name, p.name AS column_name, m.name || '_pkey' AS constraint_name
-  FROM main.sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type = 'table' AND p.pk > 0
+  FROM pg_bucketdb_rel m JOIN pragma_table_info(m.name) p WHERE m.type = 'table' AND p.pk > 0
   UNION ALL
   SELECT current_database(), 'public', current_database(), 'public', m.name, ii.name, il.name
-  FROM main.sqlite_master m JOIN pragma_index_list(m.name) il JOIN pragma_index_info(il.name) ii
+  FROM pg_bucketdb_rel m JOIN pragma_index_list(m.name) il JOIN pragma_index_info(il.name) ii
   WHERE m.type = 'table' AND il."unique" AND il.origin = 'u';
 "#;
 
@@ -501,4 +506,47 @@ pub fn register(conn: &Connection, database: &str) -> Result<()> {
         ))
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    #[test]
+    fn catalog_hides_internal_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::register(&conn, "app").unwrap();
+        conn.execute_batch(super::CATALOG).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+             CREATE TABLE sqlitex (a TEXT);
+             CREATE TABLE bucketdb_kv (key BLOB PRIMARY KEY, value BLOB, expires_at INTEGER) WITHOUT ROWID;
+             CREATE INDEX bucketdb_kv_exp ON bucketdb_kv (expires_at);
+             CREATE TABLE seq (id INTEGER PRIMARY KEY AUTOINCREMENT);",
+        )
+        .unwrap();
+        let names = |sql: &str| -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(
+            names("SELECT relname FROM pg_class WHERE relkind = 'r' ORDER BY relname"),
+            ["seq", "sqlitex", "users"]
+        );
+        assert_eq!(
+            names("SELECT table_name FROM information_schema_tables ORDER BY table_name"),
+            ["seq", "sqlitex", "users"]
+        );
+        assert_eq!(
+            names("SELECT DISTINCT table_name FROM information_schema_table_constraints ORDER BY 1"),
+            ["seq", "users"]
+        );
+        assert_eq!(
+            names("SELECT DISTINCT tablename FROM pg_indexes ORDER BY 1"),
+            ["seq", "users"]
+        );
+        assert_eq!(names("SELECT count(DISTINCT attrelid) || '' FROM pg_attribute"), ["3"]);
+        // Hidden from the catalogs, not from SQL.
+        assert_eq!(names("SELECT count(*) || '' FROM bucketdb_kv"), ["0"]);
+    }
 }

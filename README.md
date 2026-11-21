@@ -130,7 +130,8 @@ psql postgres://postgres@localhost:5432/app -c 'select count(*) from users'
   AutoMigrate reads, and psql's `\l`, `\dn`, `\d`, `\dt`, `\di`, `\d table` and
   `\d+ table` (columns, defaults, indexes, foreign keys both ways). Indexes take
   Postgres' names (`t_pkey`, `t_col_key`); there are no triggers, policies or
-  partitions to show.
+  partitions to show. Tables named `bucketdb_*` are BucketDB's own: left out of
+  the catalogs (so out of `\dt` and AutoMigrate), still readable with SQL.
 - Types: a column keeps its Postgres type as its declared type; that decides the OID.
   Booleans are 1/0, timestamps UTC text, so they sort as they compare. A parameter's
   type comes from the column it meets (`col = $1`, `IN`, `BETWEEN`, INSERT, UPDATE
