@@ -9,6 +9,7 @@
 
 mod cmd;
 mod group;
+mod hash;
 mod keys;
 mod resp;
 mod server;

@@ -1,10 +1,12 @@
-//! The data commands, over the `bucketdb_kv` table.
+//! The data commands, over the `bucketdb_kv` table (and `bucketdb_kv_hash` for
+//! the fields of hashes, in hash.rs).
 //!
 //! A key lives while `expires_at` (milliseconds since the epoch) is NULL or after
 //! now: every read filters on it, so a key is gone the moment it expires, whether
 //! or not its row is still there. Reads never delete; a write over an expired key
 //! takes it as absent and replaces its row.
 
+use crate::hash;
 use crate::keys;
 use crate::resp::Reply;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -14,20 +16,34 @@ pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS bucketdb_kv (
   key BLOB PRIMARY KEY, type INTEGER NOT NULL, value BLOB NOT NULL, expires_at INTEGER
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS bucketdb_kv_expires ON bucketdb_kv (expires_at) WHERE expires_at IS NOT NULL;";
-
-/// The same table in the connection's temp schema, for a version of the past made
-/// before there was one: it reads as empty.
-pub const TEMP_SCHEMA: &str = "CREATE TEMP TABLE IF NOT EXISTS bucketdb_kv (
-  key BLOB PRIMARY KEY, type INTEGER NOT NULL, value BLOB NOT NULL, expires_at INTEGER
+CREATE INDEX IF NOT EXISTS bucketdb_kv_expires ON bucketdb_kv (expires_at) WHERE expires_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS bucketdb_kv_hash (
+  key BLOB NOT NULL, field BLOB NOT NULL, value BLOB NOT NULL, PRIMARY KEY (key, field)
 ) WITHOUT ROWID;";
+
+/// The tables in the connection's temp schema, for a version of the past made
+/// before there were: they read as empty. By name, each to make when missing.
+pub const TEMP_TABLES: [(&str, &str); 2] = [
+    (
+        "bucketdb_kv",
+        "CREATE TEMP TABLE bucketdb_kv (
+           key BLOB PRIMARY KEY, type INTEGER NOT NULL, value BLOB NOT NULL, expires_at INTEGER
+         ) WITHOUT ROWID;",
+    ),
+    (
+        "bucketdb_kv_hash",
+        "CREATE TEMP TABLE bucketdb_kv_hash (
+           key BLOB NOT NULL, field BLOB NOT NULL, value BLOB NOT NULL, PRIMARY KEY (key, field)
+         ) WITHOUT ROWID;",
+    ),
+];
 
 pub(crate) const STRING: i64 = 0;
 
 pub(crate) const LIVE: &str = "(expires_at IS NULL OR expires_at > ?2)";
 
-const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
-const NOT_INT: &str = "ERR value is not an integer or out of range";
+pub(crate) const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+pub(crate) const NOT_INT: &str = "ERR value is not an integer or out of range";
 pub(crate) const SYNTAX: &str = "ERR syntax error";
 
 /// A command's failure: a reply for the client, or SQLite's.
@@ -102,7 +118,9 @@ fn string(c: &Connection, key: &[u8], now: i64) -> Result<Option<Entry>, Error> 
     }
 }
 
+/// Sets key to a string, over whatever it was (a hash's fields go).
 fn put(c: &Connection, key: &[u8], value: &[u8], expires_at: Option<i64>) -> rusqlite::Result<()> {
+    hash::drop_fields(c, key)?;
     c.prepare_cached(
         "INSERT INTO bucketdb_kv (key, type, value, expires_at) VALUES (?1, 0, ?2, ?3)
          ON CONFLICT (key) DO UPDATE SET type = 0, value = excluded.value, expires_at = excluded.expires_at",
@@ -116,6 +134,9 @@ fn remove(c: &Connection, key: &[u8], now: i64) -> rusqlite::Result<bool> {
     let n = c
         .prepare_cached(&format!("DELETE FROM bucketdb_kv WHERE key = ?1 AND {LIVE}"))?
         .execute(params![key, now])?;
+    if n > 0 {
+        hash::drop_fields(c, key)?;
+    }
     Ok(n > 0)
 }
 
@@ -136,6 +157,17 @@ pub(crate) fn int(arg: &[u8]) -> Option<i64> {
         return None;
     }
     std::str::from_utf8(arg).ok()?.parse().ok()
+}
+
+/// A float as Redis takes one: finite, no spaces.
+pub(crate) fn float(arg: &[u8]) -> Option<f64> {
+    let f: f64 = std::str::from_utf8(arg).ok()?.parse().ok()?;
+    f.is_finite().then_some(f)
+}
+
+/// A float as INCRBYFLOAT writes it: no exponent, no trailing zeros.
+pub(crate) fn fmt_float(f: f64) -> String {
+    format!("{f}")
 }
 
 fn int_arg(arg: &[u8]) -> Result<i64, Error> {
@@ -190,26 +222,43 @@ fn arity(name: &str) -> Reply {
     ))
 }
 
-/// Runs a data command (name upper-cased, args after it). None when the name is
-/// not one.
-pub fn run(s: &mut impl Store, name: &str, args: &[Vec<u8>]) -> Option<Reply> {
+/// Whether a command is known and has a right number of arguments: Ok, or the
+/// error to answer; None for a name that is not a data command.
+pub fn check(name: &str, args: &[Vec<u8>]) -> Option<Result<(), Reply>> {
     // The fewest arguments, and whether more are taken.
     let (min, more) = match name {
         "GET" | "GETDEL" | "TTL" | "PTTL" | "PERSIST" | "TYPE" | "STRLEN" | "INCR" | "DECR" => (1, false),
         "SET" | "GETEX" | "MGET" | "DEL" | "UNLINK" | "EXISTS" => (usize::from(name == "SET") + 1, true),
-        "SETNX" | "INCRBY" | "DECRBY" | "APPEND" => (2, false),
+        "SETNX" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "APPEND" => (2, false),
         "SETEX" | "PSETEX" => (3, false),
         "MSET" | "MSETNX" => (2, true),
         "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => (2, true),
         "DBSIZE" | "RANDOMKEY" => (0, false),
         "FLUSHDB" => (0, true),
-        "KEYS" | "EXPIRETIME" | "PEXPIRETIME" => (1, false),
+        "KEYS" | "EXPIRETIME" | "PEXPIRETIME" | "HGETALL" | "HKEYS" | "HVALS" | "HLEN" => (1, false),
         "SCAN" => (1, true),
-        "RENAME" | "RENAMENX" => (2, false),
+        "RENAME" | "RENAMENX" | "HGET" | "HEXISTS" | "HSTRLEN" => (2, false),
+        "HMGET" | "HDEL" | "HSCAN" => (2, true),
+        "HSET" | "HMSET" => (3, true),
+        "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => (3, false),
         _ => return None,
     };
-    if args.len() < min || (!more && args.len() > min) || (name.starts_with("MSET") && args.len() % 2 == 1) {
-        return Some(arity(name));
+    let odd = name.starts_with("MSET") && args.len() % 2 == 1;
+    Some(if args.len() < min || (!more && args.len() > min) || odd {
+        Err(arity(name))
+    } else {
+        Ok(())
+    })
+}
+
+/// Runs a data command (name upper-cased, args after it). None when the name is
+/// not one.
+pub fn run(s: &mut impl Store, name: &str, args: &[Vec<u8>]) -> Option<Reply> {
+    if let Err(e) = check(name, args)? {
+        return Some(e);
+    }
+    if let Some(r) = hash::run(s, name, args) {
+        return Some(reply(r));
     }
     let result = match name {
         "GET" => get(s, &args[0]),
@@ -229,6 +278,7 @@ pub fn run(s: &mut impl Store, name: &str, args: &[Vec<u8>]) -> Option<Reply> {
         "INCR" => incr(s, &args[0], 1),
         "DECR" => incr(s, &args[0], -1),
         "INCRBY" => int_arg(&args[1]).and_then(|n| incr(s, &args[0], n)),
+        "INCRBYFLOAT" => incr_float(s, &args[0], &args[1]),
         "DECRBY" => int_arg(&args[1]).and_then(|n| match n.checked_neg() {
             Some(n) => incr(s, &args[0], n),
             None => fail("ERR decrement would overflow"),
@@ -247,11 +297,15 @@ pub fn run(s: &mut impl Store, name: &str, args: &[Vec<u8>]) -> Option<Reply> {
         "FLUSHDB" => keys::flush(s, args),
         _ => dbsize(s),
     };
-    Some(match result {
+    Some(reply(result))
+}
+
+fn reply(result: Result<Reply, Error>) -> Reply {
+    match result {
         Ok(r) => r,
         Err(Error::Reply(msg)) => Reply::Error(msg),
         Err(Error::Sql(e)) => Reply::Error(sql_error(&e)),
-    })
+    }
 }
 
 /// SQLite's error as a reply.
@@ -451,6 +505,7 @@ fn kind(s: &mut impl Store, key: &[u8]) -> Result<Reply, Error> {
             match entry(c, key, now)? {
                 None => "none",
                 Some(e) if e.kind == STRING => "string",
+                Some(e) if e.kind == hash::HASH => "hash",
                 Some(_) => "unknown",
             }
             .into(),
@@ -482,6 +537,28 @@ fn incr(s: &mut impl Store, key: &[u8], by: i64) -> Result<Reply, Error> {
         };
         put(c, key, n.to_string().as_bytes(), expires_at)?;
         Ok(Reply::Int(n))
+    })
+}
+
+fn incr_float(s: &mut impl Store, key: &[u8], by: &[u8]) -> Result<Reply, Error> {
+    let Some(by) = float(by) else {
+        return fail("ERR value is not a valid float");
+    };
+    s.write(&mut |c, now| {
+        let (n, expires_at) = match string(c, key, now)? {
+            Some(e) => (
+                float(&e.value).map_or_else(|| fail("ERR value is not a valid float"), Ok)?,
+                e.expires_at,
+            ),
+            None => (0.0, None),
+        };
+        let n = n + by;
+        if !n.is_finite() {
+            return fail("ERR increment would produce NaN or Infinity");
+        }
+        let text = fmt_float(n);
+        put(c, key, text.as_bytes(), expires_at)?;
+        Ok(Reply::Bulk(text.into_bytes()))
     })
 }
 
@@ -699,6 +776,14 @@ pub(crate) mod tests {
         );
         // A failed command writes nothing.
         assert_eq!(cmd(s, "GET m"), bulk("9223372036854775807"));
+        assert_eq!(cmd(s, "INCRBYFLOAT f 10.5"), bulk("10.5"));
+        assert_eq!(cmd(s, "INCRBYFLOAT f 0.1"), bulk("10.6"));
+        assert_eq!(cmd(s, "INCRBYFLOAT f -5.6"), bulk("5"));
+        assert_eq!(
+            cmd(s, "INCRBYFLOAT f inf"),
+            Reply::err("ERR value is not a valid float")
+        );
+        assert_eq!(cmd(s, "INCRBYFLOAT x 1"), Reply::err("ERR value is not a valid float"));
     }
 
     #[test]

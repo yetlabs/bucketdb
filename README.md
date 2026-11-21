@@ -176,11 +176,16 @@ over the same database. RESP2, so redis-cli, go-redis, redis-py and the like:
   `bucketdb_writes` and `expired_keys` (rows swept).
 - Commands: `GET`, `SET` (`EX PX EXAT PXAT NX XX KEEPTTL GET`), `SETNX`, `SETEX`,
   `PSETEX`, `GETDEL`, `GETEX`, `MGET`, `MSET`, `MSETNX`, `DEL`, `UNLINK`, `EXISTS`,
-  `TYPE`, `STRLEN`, `APPEND`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `EXPIRE`,
+  `TYPE`, `STRLEN`, `APPEND`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`, `EXPIRE`,
   `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` (`NX XX GT LT`), `TTL`, `PTTL`, `PERSIST`,
   `EXPIRETIME`, `PEXPIRETIME`, `DBSIZE`, `SCAN` (`MATCH COUNT TYPE`), `KEYS`,
-  `RENAME`, `RENAMENX`, `RANDOMKEY`, `FLUSHDB`; and `PING`, `ECHO`, `AUTH` (`BUCKETDB_PASSWORD`), `HELLO 2`, `SELECT n`
+  `RENAME`, `RENAMENX`, `RANDOMKEY`, `FLUSHDB`; hashes: `HSET`, `HMSET`, `HSETNX`,
+  `HGET`, `HMGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS`,
+  `HSTRLEN`, `HINCRBY`, `HINCRBYFLOAT`, `HSCAN` (`MATCH COUNT NOVALUES`); and `PING`, `ECHO`, `AUTH` (`BUCKETDB_PASSWORD`), `HELLO 2`, `SELECT n`
   (the nth database served), `CLIENT`, `INFO`, `QUIT`.
+- A hash's fields live in `bucketdb_kv_hash`, its type and TTL in its key's row,
+  so it expires, is renamed, swept and deleted as any key; one left with no
+  fields is deleted.
 - `SCAN` walks the keys in byte order from where it stopped, so a key present
   from start to end comes back exactly once. Cursors are kept by the sidecar
   (the last 10,000), and any of its connections may go on with one. A pattern's
@@ -309,7 +314,7 @@ See [AGENTS.md](AGENTS.md) for the conventions (English, Conventional Commits).
 
 ## Not yet
 
-- Redis: hashes, `FLUSHALL`; no pub/sub, blocking commands or Lua.
+- Redis: lists, sets and sorted sets, `FLUSHALL`; no pub/sub, blocking commands or Lua.
 - CHECK constraints in `\d table`, and psql's other `\d` commands (functions, types, roles).
 - Arrays, interval arithmetic, COPY, LISTEN/NOTIFY, generate_series.
 - A foreign key or check added with ALTER TABLE is accepted but not enforced

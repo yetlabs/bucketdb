@@ -7,6 +7,7 @@
 //! prefix (`session:*`) becomes a range of the key, so it reads only those keys.
 
 use crate::cmd::{Error, STRING, SYNTAX, Store, entry, fail, upper};
+use crate::hash;
 use crate::resp::Reply;
 use rusqlite::{Connection, params};
 
@@ -19,11 +20,16 @@ pub const SWEEP_BATCH: usize = 1000;
 ///
 /// SQLite's.
 pub fn sweep(c: &Connection, now: i64) -> rusqlite::Result<usize> {
-    c.prepare_cached(
-        "DELETE FROM bucketdb_kv WHERE key IN
-           (SELECT key FROM bucketdb_kv WHERE expires_at <= ?1 LIMIT ?2)",
-    )?
-    .execute(params![now, SWEEP_BATCH as i64])
+    let gone: Vec<Vec<u8>> = c
+        .prepare_cached("SELECT key FROM bucketdb_kv WHERE expires_at <= ?1 LIMIT ?2")?
+        .query_map(params![now, SWEEP_BATCH as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for key in &gone {
+        c.prepare_cached("DELETE FROM bucketdb_kv WHERE key = ?1")?
+            .execute([key])?;
+        hash::drop_fields(c, key)?;
+    }
+    Ok(gone.len())
 }
 
 /// Whether any key has expired by now, so a sweep has rows to delete.
@@ -167,6 +173,7 @@ fn range(
 fn type_code(name: &str) -> Option<i64> {
     match name {
         "STRING" => Some(STRING),
+        "HASH" => Some(hash::HASH),
         _ => None,
     }
 }
@@ -249,10 +256,13 @@ pub fn rename(s: &mut impl Store, from: &[u8], to: &[u8], nx: bool) -> Result<Re
         if nx && entry(c, to, now)?.is_some() {
             return Ok(Reply::Int(0));
         }
-        // An expired row under the new name goes too.
+        // An expired row under the new name goes too, with any fields.
         c.prepare_cached("DELETE FROM bucketdb_kv WHERE key = ?1")?
             .execute([to])?;
+        hash::drop_fields(c, to)?;
         c.prepare_cached("UPDATE bucketdb_kv SET key = ?2 WHERE key = ?1")?
+            .execute([from, to])?;
+        c.prepare_cached("UPDATE bucketdb_kv_hash SET key = ?2 WHERE key = ?1")?
             .execute([from, to])?;
         Ok(if nx { Reply::Int(1) } else { Reply::ok() })
     })
@@ -287,7 +297,7 @@ pub fn flush(s: &mut impl Store, args: &[Vec<u8>]) -> Result<Reply, Error> {
         _ => return fail(SYNTAX),
     }
     s.write(&mut |c, _| {
-        c.execute_batch("DELETE FROM bucketdb_kv")?;
+        c.execute_batch("DELETE FROM bucketdb_kv; DELETE FROM bucketdb_kv_hash;")?;
         Ok(Reply::ok())
     })
 }

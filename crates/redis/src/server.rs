@@ -180,14 +180,16 @@ fn open(path: &std::path::Path, read_only: bool) -> rusqlite::Result<Connection>
     conn.busy_timeout(Duration::from_secs(30))?;
     conn.set_prepared_statement_cache_capacity(64);
     if read_only {
-        // A version from before the table: an empty one of the connection's own.
-        let has: bool = conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'bucketdb_kv')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !has {
-            conn.execute_batch(cmd::TEMP_SCHEMA)?;
+        // A version from before the tables: empty ones of the connection's own.
+        for (name, create) in cmd::TEMP_TABLES {
+            let has: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1)",
+                [name],
+                |r| r.get(0),
+            )?;
+            if !has {
+                conn.execute_batch(create)?;
+            }
         }
         conn.execute_batch("PRAGMA query_only = ON;")?;
     }
