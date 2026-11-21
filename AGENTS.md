@@ -28,7 +28,8 @@ diff already shows. No AI attribution in commits or pull requests.
 rustdoc with warnings denied, the tests, and rustfmt. Run it before committing.
 
 `make gorm` drives the binary end to end with GORM over pgx; it needs the local
-MinIO and a sidecar from `run-local.sh` (see README.md).
+MinIO and a sidecar from `run-local.sh` (see README.md). `make redis` does the
+same for the Redis side with go-redis, against `REDIS_URL` (a sidecar's port).
 
 ## Principles
 

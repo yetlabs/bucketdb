@@ -201,6 +201,10 @@ over the same database. RESP2, so redis-cli, go-redis, redis-py and the like:
 - Under `serve --at`, reads work and writes get `READONLY`, and keys expire as
   they had at that moment: the one given, or the version's commit for an id.
 
+Tested with go-redis v9, unchanged (`tests/redis`): its handshake, strings with
+TTLs, a lock, a pipeline, `MULTI`/`EXEC`, `WATCH` from 8 goroutines at once,
+hashes, `SCAN` and expiry, against a sidecar on MinIO.
+
 It is a durable key-value store, not a cache: a write costs what a commit costs
 (two PUTs, tens of milliseconds on S3), and writes share the database's commits
 with SQL. Reads come from the page cache. A key read soon after a write on another
@@ -315,6 +319,7 @@ database in MinIO: init 53 ms, first lookup 36 ms, cached 0.4 ms, BucketDB's RSS
 ```sh
 make check    # clippy (pedantic), rustdoc, tests, rustfmt: what CI runs
 make gorm     # GORM over pgx, end to end, against a local MinIO
+make redis    # go-redis, end to end, against a sidecar's Redis port (REDIS_URL)
 ```
 
 `run-local.sh` starts a local MinIO and serves a database from it on :5460.
