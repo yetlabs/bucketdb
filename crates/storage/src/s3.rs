@@ -72,6 +72,13 @@ pub enum Put {
     PreconditionFailed,
 }
 
+/// A failure worth one more try: a connection the server closed (pooled, idle), or a timeout.
+/// In Lambda, a call in flight when the environment is frozen between invocations outlives
+/// its timeout on the clock without having waited at all.
+fn transient(e: &ureq::Error) -> bool {
+    matches!(e, ureq::Error::Io(_) | ureq::Error::Timeout(_))
+}
+
 #[derive(Debug)]
 pub struct Client {
     cfg: Config,
@@ -179,6 +186,22 @@ impl Client {
     ///
     /// On network errors, or an HTTP status other than 200, 206, 304 and 404.
     pub fn get(&self, key: &str, range: Option<(u64, u64)>, if_none_match: Option<&str>) -> io::Result<Get> {
+        match self.get_once(key, range, if_none_match) {
+            Ok(r) => r,
+            // A pooled connection the server closed, or a call that outlived its timeout
+            // while the process was frozen (a Lambda between invocations): once more.
+            Err(e) if transient(&e) => self.get_once(key, range, if_none_match).map_err(io::Error::other)?,
+            Err(e) => Err(io::Error::other(e)),
+        }
+    }
+
+    /// One GET: the transport's error apart (the caller may retry it), the answer's otherwise.
+    fn get_once(
+        &self,
+        key: &str,
+        range: Option<(u64, u64)>,
+        if_none_match: Option<&str>,
+    ) -> Result<io::Result<Get>, ureq::Error> {
         let path = self.path(key);
         let mut req = self.agent.get(self.url(&path));
         for (k, v) in self.sign("GET", &path, EMPTY_SHA256) {
@@ -190,41 +213,19 @@ impl Client {
         if let Some(etag) = if_none_match {
             req = req.header("if-none-match", etag);
         }
-        let mut res = match req.call() {
-            Ok(r) => r,
-            // A pooled connection the server closed: once more on a new one.
-            Err(ureq::Error::Io(_)) => {
-                let mut again = self.agent.get(self.url(&path));
-                for (k, v) in self.sign("GET", &path, EMPTY_SHA256) {
-                    again = again.header(k, v);
-                }
-                if let Some((start, len)) = range {
-                    again = again.header("range", format!("bytes={start}-{}", start + len - 1));
-                }
-                if let Some(etag) = if_none_match {
-                    again = again.header("if-none-match", etag);
-                }
-                again.call().map_err(io::Error::other)?
-            }
-            Err(e) => return Err(io::Error::other(e)),
-        };
+        let mut res = req.call()?;
         self.stats.gets.fetch_add(1, Ordering::Relaxed);
-        match res.status().as_u16() {
+        Ok(match res.status().as_u16() {
             200 | 206 => {
                 let etag = header(&res, "etag");
-                let body = res
-                    .body_mut()
-                    .with_config()
-                    .limit(u64::MAX)
-                    .read_to_vec()
-                    .map_err(io::Error::other)?;
+                let body = res.body_mut().with_config().limit(u64::MAX).read_to_vec()?;
                 self.stats.get_bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
                 Ok(Get::Found { body, etag })
             }
             304 => Ok(Get::NotModified),
             404 => Ok(Get::NotFound),
             s => Err(status_error("GET", key, s, &mut res)),
-        }
+        })
     }
 
     /// See the module documentation.
@@ -247,10 +248,11 @@ impl Client {
             };
             req.send(body)
         };
-        // A pooled connection the server closed is tried once more. A conditional PUT
+        // A pooled connection the server closed, or a call that outlived its timeout while
+        // the process was frozen, is tried once more. A conditional PUT
         // that did land the first time answers 412 the second: the caller re-reads.
         let mut res = match attempt() {
-            Err(ureq::Error::Io(_)) => attempt().map_err(io::Error::other)?,
+            Err(e) if transient(&e) => attempt().map_err(io::Error::other)?,
             r => r.map_err(io::Error::other)?,
         };
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
