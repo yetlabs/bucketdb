@@ -163,6 +163,33 @@ fn sqlite_commits_through_the_vfs() {
         .query_row("SELECT v FROM t WHERE id = 1000", [], |r| r.get(0))
         .unwrap();
     assert_eq!(v, "through the bucket");
+
+    // One connection writes, another sidecar then changes a row in place (the file's
+    // size and freelist stay), and the connection writes again with no transaction of
+    // this process in between, as a sidecar with one client does. SQLite bumped the
+    // change counter it was shown when it committed: the next transaction must show it
+    // another, or SQLite keeps its page cache and writes the stale page back over the
+    // other sidecar's commit.
+    c.execute("INSERT INTO t VALUES (1001, 'ours, first')", []).unwrap();
+    let (cur, upd) = (t.file("cur.sqlite"), t.file("upd.sqlite"));
+    sync::export(&t.s3, &t.remote.db, &cur, 4).unwrap();
+    std::fs::copy(&cur, &upd).unwrap();
+    Connection::open(&upd)
+        .unwrap()
+        .execute("UPDATE t SET v = 'from the other sidecar' WHERE id = 1000", [])
+        .unwrap();
+    sync::upsert(&t.s3, &t.remote.db, &cur, &upd).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    c.execute("INSERT INTO t VALUES (1002, 'ours, again')", []).unwrap();
+    let out = t.file("after.sqlite");
+    sync::export(&t.s3, &t.remote.db, &out, 4).unwrap();
+    let after = Connection::open(&out).unwrap();
+    let theirs: String = after
+        .query_row("SELECT v FROM t WHERE id = 1000", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(theirs, "from the other sidecar");
+    let ok: String = after.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+    assert_eq!(ok, "ok");
 }
 
 /// With the bucket's versioning on, each commit is a version to read again, export,

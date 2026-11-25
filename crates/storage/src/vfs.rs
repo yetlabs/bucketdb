@@ -31,8 +31,11 @@ struct Entry {
 static REMOTES: OnceLock<HashMap<String, Arc<Entry>>> = OnceLock::new();
 static PARENT: OnceLock<usize> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-/// Each transaction's own change counter (see RemoteFile::epoch).
+/// Each transaction's own change counter (see RemoteFile::epoch). It moves by two: a
+/// transaction that commits leaves SQLite holding the counter it was shown plus one,
+/// and the next transaction's must differ from that too.
 static EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+const EPOCH_STEP: u32 = 2;
 
 /// Whether transactions track the pages they read (BUCKETDB_REPLAY, on by default),
 /// so a lost commit race can be replayed. It costs SQLite its page cache at every
@@ -515,7 +518,7 @@ unsafe extern "C" fn x_lock(f: *mut ffi::sqlite3_file, level: c_int) -> c_int {
     }
     if file.level == ffi::SQLITE_LOCK_NONE {
         file.reads.clear();
-        file.epoch = EPOCH.fetch_add(1, Ordering::Relaxed);
+        file.epoch = EPOCH.fetch_add(EPOCH_STEP, Ordering::Relaxed);
         match file.entry.db.snapshot() {
             Ok(s) => file.snap = Some(s),
             Err(e) => {
