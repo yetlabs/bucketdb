@@ -17,7 +17,25 @@ pub mod vfs;
 
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// This process's part of the names of the objects it writes. Random, not the pid:
+/// every Lambda environment starts its extension with the same pid, so two sidecars
+/// would name a segment of the same version alike, overwrite each other's object and,
+/// losing the race, delete the winner's.
+pub fn process_tag() -> &'static str {
+    static TAG: OnceLock<String> = OnceLock::new();
+    TAG.get_or_init(|| {
+        use ring::rand::SecureRandom;
+        let mut bytes = [0u8; 6];
+        if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
+            // No system randomness: the time still tells processes apart.
+            let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+            bytes.copy_from_slice(&nanos.to_be_bytes()[2..]);
+        }
+        hex::encode(bytes)
+    })
+}
 
 /// A database in a bucket: `s3://bucket/path`.
 #[derive(Debug, Clone, PartialEq, Eq)]

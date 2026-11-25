@@ -234,7 +234,7 @@ pub fn upsert(s3: &Client, db: &str, base: &str, updated: &str) -> io::Result<()
         }
         let key = format!(
             "{db}/seg/{version:012}-upsert-{}-{}",
-            std::process::id(),
+            crate::process_tag(),
             segments.len()
         );
         s3.put(&key, body, Cond::None)?;

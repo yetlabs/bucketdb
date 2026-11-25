@@ -4,7 +4,7 @@
 //! ```text
 //! <db>/manifest.json            version, page size and count, base, segments
 //! <db>/base/<id>/<chunk:08>     chunk_pages pages of the file
-//! <db>/seg/<version:012>-<n>    the pages one commit wrote, in its list's order
+//! <db>/seg/<version:012>-<tag>-<n>    the pages one commit wrote, in its list's order
 //! ```
 //!
 //! A page is in the newest segment that lists it, else in its chunk of the base. A
@@ -475,7 +475,7 @@ impl RemoteDb {
 
     fn write_segment(&self, version: u64, pages: &BTreeMap<u64, Vec<u8>>) -> io::Result<Segment> {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        let key = format!("{}/seg/{version:012}-{}-{n}", self.name, std::process::id());
+        let key = format!("{}/seg/{version:012}-{}-{n}", self.name, crate::process_tag());
         let mut body = Vec::with_capacity(pages.values().map(Vec::len).sum());
         for p in pages.values() {
             body.extend_from_slice(p);
@@ -691,7 +691,7 @@ impl RemoteDb {
             self.name,
             chrono::Utc::now().format("%Y%m%dT%H%M%S"),
             m.version,
-            std::process::id(),
+            crate::process_tag(),
             self.seq.fetch_add(1, Ordering::Relaxed)
         );
 
